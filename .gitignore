@@ -23,6 +23,10 @@ yarn-error.log*
 web/vtuber/dist/
 web/vtuber/build/
 
+# Runtime artifacts
+chat_history/
+webassets/vtuber/
+
 # Logs
 logs/
 *.log
