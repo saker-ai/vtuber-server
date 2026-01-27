@@ -1,0 +1,19 @@
+system_config:
+  host: ""
+  port: 8101
+  xiaozhi_backend_url: "ws://localhost:8002/xiaozhi/v1/"
+  xiaozhi_device_id: "00:1A:2B:3C:4D:5E"
+  xiaozhi_client_id: ""
+  xiaozhi_access_token: ""
+
+log:
+  level: "debug"
+  stdout: true
+  file:
+    enabled: true
+    path: "./logs"
+    name: "vtuber-server.log"
+    max_size_mb: 100
+    max_backups: 5
+    max_age_days: 30
+    compress: true

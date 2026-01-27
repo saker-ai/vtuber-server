@@ -1,0 +1,48 @@
+# Go
+/bin/
+/build/
+/dist/
+build/
+dist/
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Node
+node_modules/
+.pnpm-store/
+.pnp.*
+.pnpm-debug.log*
+.npm-debug.log*
+yarn-error.log*
+
+# Frontend build
+web/vtuber/dist/
+web/vtuber/build/
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.idea/
+.vscode/
+
+# Env
+.env
+.env.*
+
+# Temp
+.tmp/
+.tmp.*
+/tmp/
+
+# Coverage
+coverage.out

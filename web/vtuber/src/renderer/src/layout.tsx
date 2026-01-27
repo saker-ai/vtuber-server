@@ -1,0 +1,149 @@
+const isElectron = window.api !== undefined;
+
+const getAppHeight = () => {
+  if (typeof window !== 'undefined' && /Mobi|Android/i.test(navigator.userAgent)) {
+    return `${window.innerHeight}px`;
+  }
+  return isElectron ? 'calc(100vh - 30px)' : '100vh';
+};
+
+
+
+export const layoutStyles = {
+  appContainer: {
+    width: '100vw',
+    height: getAppHeight(),
+    backgroundColor: 'var(--app-bg)',
+    backgroundImage:
+      'radial-gradient(1200px 640px at 8% -12%, rgba(243, 106, 90, 0.24), transparent 60%), radial-gradient(900px 520px at 88% 10%, rgba(60, 142, 219, 0.22), transparent 55%), linear-gradient(135deg, var(--app-bg), var(--app-bg-2))',
+    color: 'var(--app-text)',
+    overflow: 'hidden',
+    position: 'relative',
+    display: 'flex',
+    flexDirection: { base: 'column', md: 'row' },
+    mt: isElectron ? '30px' : '0',
+    animation: 'appFadeUp 520ms ease-out',
+  },
+  sidebar: {
+    position: 'relative' as const,
+    width: { base: '100%', md: '440px' },
+    height: { base: 'auto', md: '100%' },
+    bg: 'var(--app-panel-strong)',
+    borderRight: '1px solid',
+    borderColor: 'var(--app-border)',
+    overflow: 'hidden',
+    flexShrink: 0,
+    transition: 'all 0.2s',
+    backdropFilter: 'blur(18px)',
+    boxShadow: 'var(--app-shadow)',
+  },
+  mainContent: {
+    flex: 1,
+    height: { base: 'calc(100% - 120px)', md: '100%' },
+    position: 'relative',
+    display: 'flex',
+    flexDirection: 'column',
+    transition: 'all 0.3s cubic-bezier(0.4, 0, 0.2, 1)',
+    width: '100%',
+    overflow: 'hidden',
+  },
+  canvas: {
+    position: 'relative',
+    width: '100%',
+    flex: 1,
+    transition: 'all 0.3s cubic-bezier(0.4, 0, 0.2, 1)',
+    overflow: 'hidden',
+    willChange: 'transform',
+  },
+  footer: {
+    width: '100%',
+    height: { base: '100px', md: '120px' },
+    transition: 'all 0.3s cubic-bezier(0.4, 0, 0.2, 1)',
+    willChange: 'transform',
+    position: 'relative',
+    zIndex: 1,
+  },
+  toggleButton: {
+    position: 'absolute',
+    left: 0,
+    top: '50%',
+    transform: 'translateY(-50%)',
+    height: '60px',
+    bg: 'var(--app-panel-weak)',
+    _hover: { bg: 'rgba(255, 255, 255, 0.18)' },
+    borderLeftRadius: 0,
+    borderRightRadius: 'md',
+    zIndex: 10,
+  },
+  canvasHeight: (isFooterCollapsed: boolean) => ({
+    height: isFooterCollapsed ? 'calc(100% - 24px)' : 'calc(100% - 120px)',
+  }),
+  sidebarToggleButton: {
+    position: 'absolute',
+    left: 0,
+    top: '50%',
+    transform: 'translateY(-50%)',
+    height: '60px',
+    bg: 'var(--app-panel-strong)',
+    borderLeftRadius: 0,
+    borderRightRadius: 'md',
+    zIndex: 10,
+  },
+  collapsedFooter: {
+    height: { base: '20px', md: '24px' },
+    transition: 'all 0.3s cubic-bezier(0.4, 0, 0.2, 1)',
+  },
+  windowsTitleBar: {
+    position: 'fixed',
+    top: 0,
+    left: 0,
+    width: '100vw',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    height: '30px',
+    backgroundColor: 'var(--app-panel-strong)',
+    paddingX: '10px',
+    zIndex: 1000,
+    css: { '-webkit-app-region': 'drag' },
+  },
+  macTitleBar: {
+    position: 'fixed',
+    top: 0,
+    left: 0,
+    width: '100vw',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    height: '30px',
+    backgroundColor: 'var(--app-panel-strong)',
+    zIndex: 1000,
+    css: {
+      '-webkit-app-region': 'drag',
+      '-webkit-user-select': 'none',
+    },
+  },
+  titleBarTitle: {
+    fontSize: 'sm',
+    color: 'var(--app-text-muted)',
+    textAlign: 'center',
+  },
+  titleBarButtons: {
+    display: 'flex',
+    gap: '1',
+  },
+  titleBarButton: {
+    size: 'sm',
+    variant: 'ghost',
+    color: 'var(--app-text-muted)',
+    css: { '-webkit-app-region': 'no-drag' },
+    _hover: { backgroundColor: 'rgba(255, 255, 255, 0.12)' },
+  },
+  closeButton: {
+    size: 'sm',
+    variant: 'ghost',
+    color: 'var(--app-text-muted)',
+    css: { '-webkit-app-region': 'no-drag' },
+    _hover: { backgroundColor: '#d14b4b', color: 'white' },
+  },
+} as const;

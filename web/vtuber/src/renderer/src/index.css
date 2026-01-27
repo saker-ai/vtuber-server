@@ -1,0 +1,80 @@
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Sora:wght@400;500;600;700&display=swap');
+
+:root {
+  --font-sans: "Sora", "Space Grotesk", "Noto Sans", sans-serif;
+  --font-mono: "IBM Plex Mono", "JetBrains Mono", "Fira Code", monospace;
+  color-scheme: light;
+  --app-bg: #f7f2ec;
+  --app-bg-2: #ebe2d6;
+  --app-panel: rgba(255, 255, 255, 0.78);
+  --app-panel-strong: rgba(255, 255, 255, 0.92);
+  --app-panel-weak: rgba(28, 29, 33, 0.04);
+  --app-border: rgba(35, 36, 38, 0.12);
+  --app-text: #1a1b1e;
+  --app-text-muted: #5b616b;
+  --app-accent: #f36a5a;
+  --app-accent-2: #3c8edb;
+  --app-accent-3: #1fb89a;
+  --app-accent-soft: rgba(243, 106, 90, 0.16);
+  --app-accent-2-soft: rgba(60, 142, 219, 0.16);
+  --app-shadow: 0 16px 40px rgba(19, 19, 19, 0.12);
+  --app-subtitle-bg: rgba(255, 255, 255, 0.65);
+}
+
+.dark {
+  color-scheme: dark;
+  --app-bg: #0c1016;
+  --app-bg-2: #1a2231;
+  --app-panel: rgba(16, 20, 28, 0.72);
+  --app-panel-strong: rgba(20, 24, 34, 0.92);
+  --app-panel-weak: rgba(255, 255, 255, 0.06);
+  --app-border: rgba(255, 255, 255, 0.1);
+  --app-text: #f4f6f8;
+  --app-text-muted: #b8c0cc;
+  --app-accent: #f36a5a;
+  --app-accent-2: #7aa2ff;
+  --app-accent-3: #3fe0c8;
+  --app-accent-soft: rgba(243, 106, 90, 0.18);
+  --app-accent-2-soft: rgba(122, 162, 255, 0.18);
+  --app-shadow: 0 18px 40px rgba(0, 0, 0, 0.38);
+  --app-subtitle-bg: rgba(10, 14, 20, 0.6);
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body, html {
+  margin: 0;
+  padding: 0;
+  overflow: visible;
+  background-color: var(--app-bg);
+  color: var(--app-text);
+  font-family: var(--font-sans);
+}
+
+#root {
+  height: 100%;
+}
+
+@keyframes appFadeUp {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
