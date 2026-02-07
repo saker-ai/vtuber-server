@@ -182,7 +182,7 @@ function AppContent(): JSX.Element {
 
 function App(): JSX.Element {
   return (
-    <Provider defaultTheme="light" enableSystem={false}>
+    <Provider defaultTheme="dark" enableSystem={false}>
       {/* ModeProvider needs to wrap AppContent to provide mode to getGlobalStyles */}
       <ModeProvider>
         <AppWithGlobalStyles />

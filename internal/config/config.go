@@ -12,8 +12,8 @@ import (
 
 	appdefaults "github.com/saker-ai/vtuber-server/config"
 
-	"github.com/spf13/viper"
 	"github.com/saker-ai/vtuber-server/internal/logger"
+	"github.com/spf13/viper"
 )
 
 // SystemConfig represents a systemConfig.
@@ -27,6 +27,7 @@ type SystemConfig struct {
 	XiaoZhiSampleRate      int    `mapstructure:"xiaozhi_sample_rate"`
 	XiaoZhiChannels        int    `mapstructure:"xiaozhi_channels"`
 	XiaoZhiFrameDuration   int    `mapstructure:"xiaozhi_frame_duration"`
+	XiaoZhiListenMode      string `mapstructure:"xiaozhi_listen_mode"`
 	XiaoZhiDeviceID        string `mapstructure:"xiaozhi_device_id"`
 	XiaoZhiClientID        string `mapstructure:"xiaozhi_client_id"`
 	XiaoZhiAccessToken     string `mapstructure:"xiaozhi_access_token"`
@@ -51,6 +52,7 @@ type Config struct {
 	XiaoZhiSampleRate      int             `mapstructure:"xiaozhi_sample_rate"`
 	XiaoZhiChannels        int             `mapstructure:"xiaozhi_channels"`
 	XiaoZhiFrameDuration   int             `mapstructure:"xiaozhi_frame_duration"`
+	XiaoZhiListenMode      string          `mapstructure:"xiaozhi_listen_mode"`
 	XiaoZhiDeviceID        string          `mapstructure:"xiaozhi_device_id"`
 	XiaoZhiClientID        string          `mapstructure:"xiaozhi_client_id"`
 	XiaoZhiAccessToken     string          `mapstructure:"xiaozhi_access_token"`
@@ -94,6 +96,7 @@ func Load() (Config, error) {
 	v.SetDefault("xiaozhi_sample_rate", 16000)
 	v.SetDefault("xiaozhi_channels", 1)
 	v.SetDefault("xiaozhi_frame_duration", 20)
+	v.SetDefault("xiaozhi_listen_mode", "auto")
 	v.SetDefault("tls_required", false)
 	v.SetDefault("tls_disable", false)
 	v.SetDefault("tls_cert_path", "")
@@ -101,7 +104,7 @@ func Load() (Config, error) {
 	v.SetDefault("log.level", "info")
 	v.SetDefault("log.stdout", true)
 	v.SetDefault("log.file.enabled", true)
-	v.SetDefault("log.file.path", "./logs")
+	v.SetDefault("log.file.path", "./data/logs")
 	v.SetDefault("log.file.name", "vtuber-server.log")
 	v.SetDefault("log.file.max_size_mb", 100)
 	v.SetDefault("log.file.max_backups", 5)
@@ -213,6 +216,9 @@ func applySystemConfig(cfg *Config) {
 	if cfg.XiaoZhiFrameDuration == 0 {
 		cfg.XiaoZhiFrameDuration = system.XiaoZhiFrameDuration
 	}
+	if cfg.XiaoZhiListenMode == "" {
+		cfg.XiaoZhiListenMode = system.XiaoZhiListenMode
+	}
 	if cfg.XiaoZhiDeviceID == "" {
 		cfg.XiaoZhiDeviceID = system.XiaoZhiDeviceID
 	}
@@ -272,7 +278,7 @@ func derivePaths(cfg *Config) {
 	}
 	cfg.ConfigAltsDir = resolvePath(cfg.RootDir, configAlts, "config_templates")
 	cfg.ModelDictPath = resolvePath(cfg.RootDir, cfg.ModelDictPath, filepath.Join("webassets", "model_dict.json"))
-	cfg.ChatHistoryDir = resolvePath(cfg.RootDir, cfg.ChatHistoryDir, "chat_history")
+	cfg.ChatHistoryDir = resolvePath(cfg.RootDir, cfg.ChatHistoryDir, filepath.Join("data", "vtuber", "chat"))
 	cfg.FrontendDir = resolvePath(cfg.RootDir, cfg.FrontendDir, filepath.Join("webassets", "vtuber"))
 	cfg.Live2DModelsDir = resolvePath(cfg.RootDir, cfg.Live2DModelsDir, filepath.Join("webassets", "live2d-models"))
 	cfg.BackgroundsDir = resolvePath(cfg.RootDir, cfg.BackgroundsDir, filepath.Join("webassets", "backgrounds"))

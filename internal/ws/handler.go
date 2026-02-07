@@ -24,6 +24,7 @@ import (
 	"github.com/saker-ai/vtuber-server/internal/group"
 	"github.com/saker-ai/vtuber-server/internal/storage"
 	"github.com/saker-ai/vtuber-server/internal/xiaozhi"
+	"github.com/saker-ai/vtuber-server/pkg/audio"
 )
 
 // Handler represents a handler.
@@ -41,6 +42,10 @@ type incomingMessage struct {
 	Text       string    `json:"text,omitempty"`
 	File       string    `json:"file,omitempty"`
 	Audio      []float64 `json:"audio,omitempty"`
+	AudioPCM   string    `json:"audio_pcm,omitempty"`
+	AudioRate  int       `json:"audio_sample_rate,omitempty"`
+	AudioCh    int       `json:"audio_channels,omitempty"`
+	ListenMode string    `json:"listen_mode,omitempty"`
 	RequestID  string    `json:"request_id,omitempty"`
 	Success    *bool     `json:"success,omitempty"`
 	Image      string    `json:"image,omitempty"`
@@ -74,11 +79,18 @@ type session struct {
 	unsupportedAudio bool
 	sampleRate       int
 	channels         int
-	micBuffer        []float32
+	inputSampleRate  int
+	inputChannels    int
+	micPCMBuffer     []int16
 	frameSamples     int
 	ttsBuffer        []byte
 	ttsSampleRate    int
 	ttsChannels      int
+	resampler        *audio.StreamResampler
+	opusEncoder      *audio.OpusEncoder
+	opusScratch      []int16
+	pcmBytesScratch  []byte
+	listenMode       string
 
 	mcpMu          sync.Mutex
 	mcpWaiters     map[string]chan captureResponse
@@ -86,6 +98,16 @@ type session struct {
 	mcpVisionToken string
 	deviceID       string
 	clientID       string
+
+	micChunkCount int
+	micBytes      int
+	lastMicLog    time.Time
+	lastMicRate   int
+	lastMicCh     int
+
+	ttsChunkCount int
+	ttsBytes      int
+	lastTTSLog    time.Time
 }
 
 const ttsChunkDurationMs = 300
@@ -159,6 +181,7 @@ func (h *Handler) Handle(w http.ResponseWriter, r *http.Request) {
 			Channels:      h.config.XiaoZhiChannels,
 			FrameDuration: h.config.XiaoZhiFrameDuration,
 		},
+		ListenMode:  h.config.XiaoZhiListenMode,
 		DeviceID:    fallbackID(h.config.XiaoZhiDeviceID, "mio-device-"+sessionID),
 		ClientID:    fallbackID(h.config.XiaoZhiClientID, "mio-client-"+sessionID),
 		AccessToken: h.config.XiaoZhiAccessToken,
@@ -178,10 +201,20 @@ func (h *Handler) Handle(w http.ResponseWriter, r *http.Request) {
 		audioFormat:     h.config.XiaoZhiAudioFormat,
 		sampleRate:      h.config.XiaoZhiSampleRate,
 		channels:        h.config.XiaoZhiChannels,
+		inputSampleRate: h.config.XiaoZhiSampleRate,
+		inputChannels:   h.config.XiaoZhiChannels,
 		frameSamples:    h.config.XiaoZhiSampleRate * h.config.XiaoZhiFrameDuration / 1000,
+		listenMode:      h.config.XiaoZhiListenMode,
 		mcpWaiters:      make(map[string]chan captureResponse),
 		deviceID:        xzCfg.DeviceID,
 		clientID:        xzCfg.ClientID,
+	}
+	if sess.audioFormat == "opus" {
+		if enc, err := audio.AcquireOpusEncoder(sess.sampleRate, sess.channels, sess.frameDuration); err != nil {
+			sess.logger.Warn("opus encoder init failed", zap.Error(err))
+		} else {
+			sess.opusEncoder = enc
+		}
 	}
 
 	sess.logger.Info("ws session opened",
@@ -274,6 +307,14 @@ func (h *Handler) Handle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sess.xiaozhi.Close()
+	if sess.resampler != nil {
+		sess.resampler.Close()
+		sess.resampler = nil
+	}
+	if sess.opusEncoder != nil {
+		audio.ReleaseOpusEncoder(sess.opusEncoder)
+		sess.opusEncoder = nil
+	}
 	sess.logger.Info("ws session closed", zap.String("session_id", sess.clientUID))
 	h.unregisterSession(sess.clientUID)
 }
@@ -294,9 +335,15 @@ func (s *session) handleIncoming(ctx context.Context, msg incomingMessage) {
 		}
 		s.endConversation()
 	case "mic-audio-data":
-		s.handleMicAudio(ctx, msg.Audio)
+		if msg.AudioPCM != "" {
+			s.handleMicAudioPCM(ctx, msg.AudioPCM, msg.AudioRate, msg.AudioCh)
+		} else {
+			s.handleMicAudio(ctx, msg.Audio)
+		}
 	case "mic-audio-end":
 		s.handleMicEnd(ctx)
+	case "set-listen-mode":
+		s.handleSetListenMode(msg.ListenMode)
 	case "mcp-capture-response":
 		s.handleCaptureResponse(msg)
 	case "frontend-playback-complete":
@@ -336,49 +383,39 @@ func (s *session) handleIncoming(ctx context.Context, msg incomingMessage) {
 	}
 }
 
-func (s *session) handleMicAudio(ctx context.Context, audio []float64) {
-	if len(audio) == 0 {
+func (s *session) handleMicAudio(ctx context.Context, samples []float64) {
+	if len(samples) == 0 {
 		return
 	}
-	if !s.listening {
-		if err := s.xiaozhi.SendListenState(ctx, "start"); err == nil {
-			s.logger.Info("xiaozhi listen start", zap.String("session_id", s.clientUID))
-		} else {
-			s.logger.Warn("xiaozhi listen start failed", zap.Error(err))
-		}
-		s.listening = true
-	}
-	s.logger.Debug("mic audio received",
-		zap.String("session_id", s.clientUID),
-		zap.Int("samples", len(audio)),
-		zap.String("format", s.audioFormat),
-	)
-	if s.audioFormat == "opus" {
-		s.handleMicAudioOpus(ctx, audio)
+	tmp := float64ToFloat32(samples)
+	pcm := audio.Float32SliceToInt16SliceInto(audio.AcquireInt16(len(tmp)), tmp)
+	pcmBytes := audio.Int16SliceToBytesInto(audio.AcquireBytes(len(pcm)*2), pcm)
+	s.handleMicPCMBytes(ctx, pcmBytes, s.sampleRate, s.channels)
+	audio.ReleaseBytes(pcmBytes)
+	audio.ReleaseInt16(pcm)
+	audio.ReleaseFloat32(tmp)
+}
+
+func (s *session) handleMicAudioPCM(ctx context.Context, audioPCM string, sampleRate int, channels int) {
+	if audioPCM == "" {
 		return
 	}
-	if s.audioFormat != "pcm16" && s.audioFormat != "pcm" {
-		if !s.unsupportedAudio {
-			s.unsupportedAudio = true
-			s.logger.Warn("unsupported mic audio format",
-				zap.String("session_id", s.clientUID),
-				zap.String("format", s.audioFormat),
-			)
-			s.sendJSON(map[string]any{"type": "error", "message": "unsupported xiaozhi_audio_format for mic input"})
-		}
+	pcm, err := base64.StdEncoding.DecodeString(audioPCM)
+	if err != nil {
+		s.logger.Warn("mic audio pcm decode failed", zap.Error(err))
+		s.sendJSON(map[string]any{"type": "error", "message": "invalid mic audio pcm"})
 		return
 	}
-	pcm := float32ToPCM16(audio)
-	if err := s.xiaozhi.SendAudio(ctx, pcm); err != nil {
-		s.logger.Warn("xiaozhi send audio failed", zap.Error(err))
-		s.sendJSON(map[string]any{"type": "error", "message": err.Error()})
+	if len(pcm) == 0 {
+		return
 	}
+	s.lastMicRate = sampleRate
+	s.lastMicCh = channels
+	s.handleMicPCMBytes(ctx, pcm, sampleRate, channels)
 }
 
 func (s *session) handleMicEnd(ctx context.Context) {
-	if s.audioFormat == "opus" {
-		s.flushMicBuffer(ctx)
-	}
+	s.flushMicBuffer(ctx, true)
 	if s.listening {
 		if err := s.xiaozhi.SendListenState(ctx, "stop"); err == nil {
 			s.logger.Info("xiaozhi listen stop", zap.String("session_id", s.clientUID))
@@ -391,79 +428,263 @@ func (s *session) handleMicEnd(ctx context.Context) {
 		zap.String("session_id", s.clientUID),
 		zap.Int("llm_chars", len(s.llmText)),
 	)
-	s.logger.Debug("mic audio end", zap.String("session_id", s.clientUID))
+	s.logger.Info("mic audio end",
+		zap.String("session_id", s.clientUID),
+		zap.Int("chunks", s.micChunkCount),
+		zap.Int("bytes", s.micBytes),
+		zap.Int("input_rate", s.lastMicRate),
+		zap.Int("input_channels", s.lastMicCh),
+		zap.Int("target_rate", s.sampleRate),
+		zap.Int("target_channels", s.channels),
+	)
+	s.micChunkCount = 0
+	s.micBytes = 0
 	s.ensureConversation()
 	if s.llmText == "" {
 		s.sendJSON(map[string]any{"type": "full-text", "text": "Thinking..."})
 	}
 }
 
-func (s *session) handleMicAudioOpus(ctx context.Context, audio []float64) {
-	s.micBuffer = append(s.micBuffer, float64ToFloat32(audio)...)
+func (s *session) handleSetListenMode(mode string) {
+	mode = strings.TrimSpace(mode)
+	if mode == "" {
+		return
+	}
+	switch mode {
+	case "realtime", "auto", "manual":
+		if s.listenMode != mode {
+			s.logger.Info("listen mode updated",
+				zap.String("session_id", s.clientUID),
+				zap.String("mode", mode),
+			)
+		}
+		s.listenMode = mode
+		s.xiaozhi.SetListenMode(mode)
+	default:
+		s.logger.Warn("invalid listen mode",
+			zap.String("session_id", s.clientUID),
+			zap.String("mode", mode),
+		)
+	}
+}
+
+func (s *session) handleMicPCMBytes(ctx context.Context, pcm []byte, sampleRate int, channels int) {
+	if len(pcm) == 0 {
+		return
+	}
+	if !s.listening {
+		if err := s.xiaozhi.SendListenState(ctx, "start"); err == nil {
+			s.logger.Info("xiaozhi listen start", zap.String("session_id", s.clientUID))
+		} else {
+			s.logger.Warn("xiaozhi listen start failed", zap.Error(err))
+		}
+		s.listening = true
+	}
+
+	inputRate := sampleRate
+	if inputRate <= 0 {
+		inputRate = s.inputSampleRate
+	}
+	inputCh := channels
+	if inputCh <= 0 {
+		inputCh = s.inputChannels
+	}
+	if inputRate <= 0 {
+		inputRate = s.sampleRate
+	}
+	if inputCh <= 0 {
+		inputCh = s.channels
+	}
+	if inputRate != s.inputSampleRate || inputCh != s.inputChannels {
+		s.inputSampleRate = inputRate
+		s.inputChannels = inputCh
+		if s.resampler != nil {
+			s.resampler.Close()
+			s.resampler = nil
+		}
+	}
+
+	s.micChunkCount++
+	s.micBytes += len(pcm)
+	now := time.Now()
+	if s.lastMicLog.IsZero() || now.Sub(s.lastMicLog) >= 2*time.Second {
+		s.lastMicLog = now
+		s.logger.Info("mic audio stats",
+			zap.String("session_id", s.clientUID),
+			zap.Int("chunks", s.micChunkCount),
+			zap.Int("bytes", s.micBytes),
+			zap.Int("input_rate", inputRate),
+			zap.Int("input_channels", inputCh),
+			zap.Int("target_rate", s.sampleRate),
+			zap.Int("target_channels", s.channels),
+			zap.String("format", s.audioFormat),
+			zap.Bool("resampling", s.resampler != nil),
+			zap.Bool("listening", s.listening),
+		)
+		s.micChunkCount = 0
+		s.micBytes = 0
+	}
+
+	if s.audioFormat != "opus" && s.audioFormat != "pcm16" && s.audioFormat != "pcm" {
+		if !s.unsupportedAudio {
+			s.unsupportedAudio = true
+			s.logger.Warn("unsupported mic audio format",
+				zap.String("session_id", s.clientUID),
+				zap.String("format", s.audioFormat),
+			)
+			s.sendJSON(map[string]any{"type": "error", "message": "unsupported xiaozhi_audio_format for mic input"})
+		}
+		return
+	}
+
+	if inputRate != s.sampleRate {
+		if s.resampler == nil {
+			res, err := audio.NewStreamResampler(inputRate, s.sampleRate)
+			if err != nil {
+				s.logger.Warn("resampler init failed", zap.Error(err))
+			} else {
+				s.resampler = res
+			}
+		}
+	}
+
+	if s.resampler != nil {
+		scratch := audio.BytesToInt16SliceInto(s.opusScratch, pcm)
+		s.opusScratch = scratch
+		if err := s.resampler.AppendPCM(scratch); err != nil {
+			s.logger.Warn("resampler append failed", zap.Error(err))
+			return
+		}
+		s.processResampledFrames(ctx, false)
+		return
+	}
+
+	s.appendPCMBuffer(pcm)
+	s.processPCMFrames(ctx, false)
+}
+
+func (s *session) processResampledFrames(ctx context.Context, flush bool) {
 	frameSize := s.frameSamples * s.channels
 	if frameSize <= 0 {
 		frameSize = 960 * maxInt(1, s.channels)
 	}
+	if flush {
+		if err := s.resampler.Flush(); err != nil {
+			s.logger.Warn("resampler flush failed", zap.Error(err))
+		}
+	}
 	framesSent := 0
-	for len(s.micBuffer) >= frameSize {
-		frame := s.micBuffer[:frameSize]
-		s.micBuffer = s.micBuffer[frameSize:]
-		encoded, err := s.xiaozhi.EncodeOpusFloat(frame)
-		if err != nil {
-			s.logger.Warn("opus encode failed", zap.Error(err))
-			s.sendJSON(map[string]any{"type": "error", "message": err.Error()})
-			return
+	for {
+		frame, ok := s.resampler.PopFrame(frameSize)
+		if !ok {
+			break
 		}
-		if err := s.xiaozhi.SendAudio(ctx, encoded); err != nil {
-			s.logger.Warn("xiaozhi send opus audio failed", zap.Error(err))
-			s.sendJSON(map[string]any{"type": "error", "message": err.Error()})
-			return
-		}
+		s.sendPCMFrame(ctx, frame)
+		audio.ReleaseInt16(frame)
 		framesSent++
 	}
+	if flush {
+		if frame := s.resampler.PopRemainderPadded(frameSize); frame != nil {
+			s.sendPCMFrame(ctx, frame)
+			audio.ReleaseInt16(frame)
+			framesSent++
+		}
+	}
 	if framesSent > 0 {
-		s.logger.Debug("mic audio opus frames sent",
+		s.logger.Debug("mic audio frames sent",
 			zap.String("session_id", s.clientUID),
 			zap.Int("frames", framesSent),
 		)
 	}
 }
 
-func (s *session) flushMicBuffer(ctx context.Context) {
+func (s *session) appendPCMBuffer(pcm []byte) {
+	samples := audio.BytesToInt16SliceInto(s.opusScratch, pcm)
+	s.opusScratch = samples
+	s.micPCMBuffer = append(s.micPCMBuffer, samples...)
+}
+
+func (s *session) processPCMFrames(ctx context.Context, flush bool) {
 	frameSize := s.frameSamples * s.channels
 	if frameSize <= 0 {
 		frameSize = 960 * maxInt(1, s.channels)
 	}
-	if len(s.micBuffer) == 0 {
+	framesSent := 0
+	for len(s.micPCMBuffer) >= frameSize {
+		frame := s.micPCMBuffer[:frameSize]
+		s.micPCMBuffer = s.micPCMBuffer[frameSize:]
+		s.sendPCMFrame(ctx, frame)
+		framesSent++
+	}
+	if flush && len(s.micPCMBuffer) > 0 {
+		frame := s.micPCMBuffer
+		s.micPCMBuffer = nil
+		s.sendPCMFrame(ctx, frame)
+		framesSent++
+	}
+	if framesSent > 0 {
+		s.logger.Debug("mic audio frames sent",
+			zap.String("session_id", s.clientUID),
+			zap.Int("frames", framesSent),
+		)
+	}
+}
+
+func (s *session) sendPCMFrame(ctx context.Context, frame []int16) {
+	if len(frame) == 0 {
 		return
 	}
-	padding := frameSize - (len(s.micBuffer) % frameSize)
-	if padding != frameSize {
-		for i := 0; i < padding; i++ {
-			s.micBuffer = append(s.micBuffer, 0)
+	if s.audioFormat == "opus" {
+		if s.opusEncoder != nil {
+			frameBytes := audio.Int16SliceToBytesInto(s.pcmBytesScratch, frame)
+			s.pcmBytesScratch = frameBytes
+			encoded, err := s.opusEncoder.EncodeWithScratch(frameBytes, s.opusScratch)
+			if err != nil {
+				s.logger.Warn("opus encode failed", zap.Error(err))
+				s.sendJSON(map[string]any{"type": "error", "message": err.Error()})
+				return
+			}
+			if len(encoded) == 0 {
+				return
+			}
+			if err := s.xiaozhi.SendAudio(ctx, encoded); err != nil {
+				s.logger.Warn("xiaozhi send opus audio failed", zap.Error(err))
+				s.sendJSON(map[string]any{"type": "error", "message": err.Error()})
+			}
+			return
 		}
-	}
-	framesSent := 0
-	for len(s.micBuffer) >= frameSize {
-		frame := s.micBuffer[:frameSize]
-		s.micBuffer = s.micBuffer[frameSize:]
-		encoded, err := s.xiaozhi.EncodeOpusFloat(frame)
+		tmp := audio.Int16SliceToFloat32Into(audio.AcquireFloat32(len(frame)), frame)
+		encoded, err := s.xiaozhi.EncodeOpusFloat(tmp)
+		audio.ReleaseFloat32(tmp)
 		if err != nil {
 			s.logger.Warn("opus encode failed", zap.Error(err))
 			s.sendJSON(map[string]any{"type": "error", "message": err.Error()})
 			return
 		}
+		if len(encoded) == 0 {
+			return
+		}
 		if err := s.xiaozhi.SendAudio(ctx, encoded); err != nil {
 			s.logger.Warn("xiaozhi send opus audio failed", zap.Error(err))
 			s.sendJSON(map[string]any{"type": "error", "message": err.Error()})
-			return
 		}
-		framesSent++
+		return
 	}
-	s.logger.Debug("mic buffer flushed",
-		zap.String("session_id", s.clientUID),
-		zap.Int("frames", framesSent),
-	)
+
+	pcmBytes := audio.Int16SliceToBytesInto(s.pcmBytesScratch, frame)
+	s.pcmBytesScratch = pcmBytes
+	if err := s.xiaozhi.SendAudio(ctx, pcmBytes); err != nil {
+		s.logger.Warn("xiaozhi send audio failed", zap.Error(err))
+		s.sendJSON(map[string]any{"type": "error", "message": err.Error()})
+	}
+}
+
+func (s *session) flushMicBuffer(ctx context.Context, flush bool) {
+	if s.resampler != nil {
+		s.processResampledFrames(ctx, flush)
+		return
+	}
+	s.processPCMFrames(ctx, flush)
 }
 
 func (s *session) handleCaptureResponse(msg incomingMessage) {
@@ -638,6 +859,10 @@ func (s *session) handleTTS(state string, text string) {
 		s.ttsBuffer = nil
 		s.ttsSampleRate = 0
 		s.ttsChannels = 0
+		s.ttsChunkCount = 0
+		s.ttsBytes = 0
+		s.lastTTSLog = time.Now()
+		s.logger.Info("tts start", zap.String("session_id", s.clientUID))
 		if s.llmText == "" {
 			s.sendJSON(map[string]any{"type": "full-text", "text": "Thinking..."})
 		}
@@ -645,6 +870,13 @@ func (s *session) handleTTS(state string, text string) {
 		s.ttsActive = false
 		s.flushTTSAudio(true)
 		s.sendJSON(map[string]any{"type": "backend-synth-complete"})
+		s.logger.Info("tts stop",
+			zap.String("session_id", s.clientUID),
+			zap.Int("chunks", s.ttsChunkCount),
+			zap.Int("bytes", s.ttsBytes),
+			zap.Int("sample_rate", s.ttsSampleRate),
+			zap.Int("channels", s.ttsChannels),
+		)
 		s.endConversation()
 	}
 }
@@ -735,6 +967,21 @@ func (s *session) sendAudioChunk(pcm []byte, sampleRate int, channels int) {
 	}
 	s.sendJSON(payload)
 	s.displaySent = true
+	s.ttsChunkCount++
+	s.ttsBytes += len(pcm)
+	now := time.Now()
+	if s.lastTTSLog.IsZero() || now.Sub(s.lastTTSLog) >= 2*time.Second {
+		s.lastTTSLog = now
+		s.logger.Info("tts audio stats",
+			zap.String("session_id", s.clientUID),
+			zap.Int("chunks", s.ttsChunkCount),
+			zap.Int("bytes", s.ttsBytes),
+			zap.Int("sample_rate", sampleRate),
+			zap.Int("channels", channels),
+		)
+		s.ttsChunkCount = 0
+		s.ttsBytes = 0
+	}
 }
 
 func (s *session) buildDisplayText() map[string]any {
@@ -1090,29 +1337,6 @@ func fallbackID(value string, fallback string) string {
 		return value
 	}
 	return fallback
-}
-
-func float32ToPCM16(samples []float64) []byte {
-	if len(samples) == 0 {
-		return nil
-	}
-	pcm := make([]byte, len(samples)*2)
-	for i, sample := range samples {
-		value := clamp(sample, -1.0, 1.0)
-		scaled := int16(math.Round(value * 32767.0))
-		binary.LittleEndian.PutUint16(pcm[i*2:], uint16(scaled))
-	}
-	return pcm
-}
-
-func clamp(value float64, min float64, max float64) float64 {
-	if value < min {
-		return min
-	}
-	if value > max {
-		return max
-	}
-	return value
 }
 
 func computeVolumes(pcm []byte, sampleRate int, channels int, frameDuration int) []float64 {

@@ -44,6 +44,16 @@ const deriveWsUrlFromBase = (baseUrl: string): string | null => {
   }
 };
 
+const shouldRewriteWsScheme = (baseUrl: string, wsUrl: string): boolean => {
+  try {
+    const base = new URL(baseUrl);
+    const ws = new URL(wsUrl);
+    return base.host === ws.host;
+  } catch {
+    return true;
+  }
+};
+
 export interface HistoryInfo {
   uid: string;
   latest_message: {
@@ -99,10 +109,18 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
       const derived = deriveWsUrlFromBase(normalizedBaseUrl());
       return derived || DEFAULT_WS_URL;
     }
-    if (normalizedBaseUrl().startsWith('https://') && wsUrl.startsWith('ws://')) {
+    if (
+      normalizedBaseUrl().startsWith('https://') &&
+      wsUrl.startsWith('ws://') &&
+      shouldRewriteWsScheme(normalizedBaseUrl(), wsUrl)
+    ) {
       return wsUrl.replace(/^ws:\/\//, 'wss://');
     }
-    if (normalizedBaseUrl().startsWith('http://') && wsUrl.startsWith('wss://')) {
+    if (
+      normalizedBaseUrl().startsWith('http://') &&
+      wsUrl.startsWith('wss://') &&
+      shouldRewriteWsScheme(normalizedBaseUrl(), wsUrl)
+    ) {
       return wsUrl.replace(/^wss:\/\//, 'ws://');
     }
     return wsUrl;

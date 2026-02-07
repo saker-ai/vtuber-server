@@ -73,7 +73,7 @@ func buildSinks(cfg Config) (zapcore.WriteSyncer, error) {
 func newFileWriter(fileCfg FileConfig) (*lumberjack.Logger, error) {
 	dir := strings.TrimSpace(fileCfg.Path)
 	if dir == "" {
-		dir = "./logs"
+		dir = "./data/logs"
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("create log directory %s: %w", dir, err)

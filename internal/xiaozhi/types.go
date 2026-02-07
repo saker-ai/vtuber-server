@@ -13,6 +13,7 @@ type Config struct {
 	BackendURL      string
 	ProtocolVersion int
 	AudioParams     AudioParams
+	ListenMode      string
 	DeviceID        string
 	ClientID        string
 	AccessToken     string

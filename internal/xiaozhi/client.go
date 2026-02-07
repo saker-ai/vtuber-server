@@ -46,6 +46,8 @@ type Client struct {
 	closed  bool
 	decoder *godepsopus.Decoder
 	encoder *godepsopus.Encoder
+	listen  string
+	writeMu sync.Mutex
 }
 
 // NewClient executes the newClient function.
@@ -72,6 +74,7 @@ func NewClient(cfg Config, callbacks Callbacks, logger *zap.Logger) *Client {
 		callbacks: callbacks,
 		decoder:   decoder,
 		encoder:   encoder,
+		listen:    cfg.ListenMode,
 	}
 }
 
@@ -96,7 +99,7 @@ func (c *Client) SendTextInput(ctx context.Context, text string) error {
 	payload := map[string]any{
 		"type":      "listen",
 		"state":     "detect",
-		"mode":      "auto",
+		"mode":      c.listenMode(),
 		"text":      text,
 		"device_id": c.cfg.DeviceID,
 	}
@@ -108,7 +111,7 @@ func (c *Client) SendListenState(ctx context.Context, state string) error {
 	payload := map[string]any{
 		"type":      "listen",
 		"state":     state,
-		"mode":      "auto",
+		"mode":      c.listenMode(),
 		"device_id": c.cfg.DeviceID,
 	}
 	return c.sendJSON(ctx, payload)
@@ -134,6 +137,8 @@ func (c *Client) SendAudio(ctx context.Context, pcm []byte) error {
 	if conn == nil {
 		return errors.New("xiaozhi connection not ready")
 	}
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	if err := conn.WriteMessage(websocket.BinaryMessage, pcm); err != nil {
 		return err
 	}
@@ -175,6 +180,8 @@ func (c *Client) sendJSON(ctx context.Context, payload any) error {
 	if conn == nil {
 		return errors.New("xiaozhi connection not ready")
 	}
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	if err := conn.WriteJSON(payload); err != nil {
 		return err
 	}
@@ -234,6 +241,11 @@ func (c *Client) connectOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	conn.SetPingHandler(func(appData string) error {
+		c.writeMu.Lock()
+		defer c.writeMu.Unlock()
+		return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(5*time.Second))
+	})
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
@@ -252,6 +264,7 @@ func (c *Client) connectOnce(ctx context.Context) error {
 func (c *Client) sendHello(ctx context.Context) error {
 	payload := map[string]any{
 		"type":      "hello",
+		"device_id": c.cfg.DeviceID,
 		"version":   c.cfg.ProtocolVersion,
 		"features":  map[string]any{"mcp": true},
 		"transport": "websocket",
@@ -263,6 +276,26 @@ func (c *Client) sendHello(ctx context.Context) error {
 		},
 	}
 	return c.sendJSON(ctx, payload)
+}
+
+func (c *Client) listenMode() string {
+	c.mu.Lock()
+	mode := c.listen
+	c.mu.Unlock()
+	if mode == "" {
+		return "realtime"
+	}
+	return mode
+}
+
+// SetListenMode updates the listen mode sent to Xiaozhi.
+func (c *Client) SetListenMode(mode string) {
+	if mode == "" {
+		return
+	}
+	c.mu.Lock()
+	c.listen = mode
+	c.mu.Unlock()
 }
 
 func (c *Client) readLoop() error {

@@ -97,6 +97,18 @@ const DEFAULT_VAD_SETTINGS: VADSettings = {
   redemptionFrames: 35,
 };
 
+const VAD_OUTPUT_SAMPLE_RATE = 16000;
+const VAD_OUTPUT_CHANNELS = 1;
+
+const isAudioDebugEnabled = () => {
+  if (import.meta.env.VITE_DEBUG_AUDIO === 'true') return true;
+  try {
+    return localStorage.getItem('debugAudio') === '1';
+  } catch {
+    return false;
+  }
+};
+
 const getDefaultBoolean = (value: string | undefined, fallback: boolean): boolean => {
   if (value === 'true' || value === '1') {
     return true;
@@ -118,7 +130,7 @@ const getDefaultVADState = () => {
   );
   const defaultAutoStartMicOnConvEnd = getDefaultBoolean(
     import.meta.env.VITE_DEFAULT_AUTO_START_MIC_ON_CONV_END,
-    true,
+    false,
   );
   return {
     micOn: defaultMicOn,
@@ -152,7 +164,7 @@ export function VADProvider({ children }: { children: React.ReactNode }) {
 
   // Persistent state management
   const [micOn, setMicOn] = useLocalStorage('micOn', DEFAULT_VAD_STATE.micOn);
-  const autoStopMicRef = useRef(true);
+  const autoStopMicRef = useRef(DEFAULT_VAD_STATE.autoStopMic);
   const [autoStopMic, setAutoStopMicState] = useLocalStorage(
     'autoStopMic',
     DEFAULT_VAD_STATE.autoStopMic,
@@ -165,12 +177,12 @@ export function VADProvider({ children }: { children: React.ReactNode }) {
     'autoStartMicOn',
     DEFAULT_VAD_STATE.autoStartMicOn,
   );
-  const autoStartMicRef = useRef(false);
+  const autoStartMicRef = useRef(DEFAULT_VAD_STATE.autoStartMicOn);
   const [autoStartMicOnConvEnd, setAutoStartMicOnConvEndState] = useLocalStorage(
     'autoStartMicOnConvEnd',
     DEFAULT_VAD_STATE.autoStartMicOnConvEnd,
   );
-  const autoStartMicOnConvEndRef = useRef(false);
+  const autoStartMicOnConvEndRef = useRef(DEFAULT_VAD_STATE.autoStartMicOnConvEnd);
   const [voiceInterruptEnabled, setVoiceInterruptEnabledState] = useLocalStorage(
     'voiceInterruptEnabled',
     DEFAULT_VAD_STATE.voiceInterruptEnabled,
@@ -255,7 +267,14 @@ export function VADProvider({ children }: { children: React.ReactNode }) {
   /**
    * Handle speech start event (initial detection)
    */
-  const handleSpeechStart = useCallback(() => {
+const handleSpeechStart = useCallback(() => {
+    if (isAudioDebugEnabled()) {
+      console.info('[vad] speech start', {
+        micOn,
+        voiceInterruptEnabled: voiceInterruptEnabledRef.current,
+        aiState: aiStateRef.current,
+      });
+    }
     console.log('Speech started - saving current state');
     if (
       aiStateRef.current === 'thinking-speaking'
@@ -275,9 +294,16 @@ export function VADProvider({ children }: { children: React.ReactNode }) {
   /**
    * Handle real speech start event (confirmed speech)
    */
-  const handleSpeechRealStart = useCallback(() => {
+const handleSpeechRealStart = useCallback(() => {
     if (!isProcessingRef.current) {
       return;
+    }
+    if (isAudioDebugEnabled()) {
+      console.info('[vad] speech real start', {
+        micOn,
+        voiceInterruptEnabled: voiceInterruptEnabledRef.current,
+        aiState: aiStateRef.current,
+      });
     }
     console.log('Real speech confirmed - checking if need to interrupt');
     // Check if we need to interrupt based on the PREVIOUS state (before speech started)
@@ -305,8 +331,16 @@ export function VADProvider({ children }: { children: React.ReactNode }) {
   /**
    * Handle speech end event
    */
-  const handleSpeechEnd = useCallback((audio: Float32Array) => {
+const handleSpeechEnd = useCallback((audio: Float32Array) => {
     if (!isProcessingRef.current) return;
+    if (isAudioDebugEnabled()) {
+      console.info('[vad] speech end', {
+        frames: audio.length,
+        sampleRate: VAD_OUTPUT_SAMPLE_RATE,
+        channels: VAD_OUTPUT_CHANNELS,
+        micOn,
+      });
+    }
     console.log('Speech ended');
     audioTaskQueue.clearQueue();
 
@@ -317,7 +351,7 @@ export function VADProvider({ children }: { children: React.ReactNode }) {
     }
 
     setPreviousTriggeredProbability(0);
-    sendAudioPartitionRef.current(audio);
+    sendAudioPartitionRef.current(audio, VAD_OUTPUT_SAMPLE_RATE, VAD_OUTPUT_CHANNELS);
     isProcessingRef.current = false;
     setAiStateRef.current("thinking-speaking");
   }, []);
@@ -325,8 +359,11 @@ export function VADProvider({ children }: { children: React.ReactNode }) {
   /**
    * Handle VAD misfire event
    */
-  const handleVADMisfire = useCallback(() => {
+const handleVADMisfire = useCallback(() => {
     if (!isProcessingRef.current) return;
+    if (isAudioDebugEnabled()) {
+      console.info('[vad] misfire');
+    }
     console.log('VAD misfire detected');
     setPreviousTriggeredProbability(0);
     isProcessingRef.current = false;
@@ -352,7 +389,10 @@ export function VADProvider({ children }: { children: React.ReactNode }) {
   /**
    * Initialize new VAD instance
    */
-  const initVAD = async () => {
+const initVAD = async () => {
+    if (isAudioDebugEnabled()) {
+      console.info('[vad] init');
+    }
     const newVAD = await MicVAD.new({
       model: "v5",
       preSpeechPadFrames: 20,
@@ -375,10 +415,13 @@ export function VADProvider({ children }: { children: React.ReactNode }) {
   /**
    * Start microphone and VAD processing
    */
-  const startMic = useCallback(async (source: 'auto' | 'user' = 'user') => {
+const startMic = useCallback(async (source: 'auto' | 'user' = 'user') => {
     if (startInFlightRef.current) return;
     startInFlightRef.current = true;
     try {
+      if (isAudioDebugEnabled()) {
+        console.info('[mic] start', { source });
+      }
       if (!vadRef.current) {
         console.log('Initializing VAD');
         await initVAD();
@@ -451,7 +494,10 @@ export function VADProvider({ children }: { children: React.ReactNode }) {
   /**
    * Stop microphone and VAD processing
    */
-  const stopMic = useCallback((source: 'system' | 'user' = 'system') => {
+const stopMic = useCallback((source: 'system' | 'user' = 'system') => {
+    if (isAudioDebugEnabled()) {
+      console.info('[mic] stop', { source });
+    }
     console.log('Stopping VAD');
     if (vadRef.current) {
       vadRef.current.pause();

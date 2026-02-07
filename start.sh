@@ -7,6 +7,18 @@ cd "$SCRIPT_DIR"
 DEFAULT_PORT="${DEFAULT_PORT:-8101}"
 CONFIG_PATH="${CONFIG_PATH:-}"
 
+extract_port_from_http_addr() {
+  local addr="$1"
+  addr="${addr//\"/}"
+  addr="${addr// /}"
+  addr="${addr##*:}"
+  if [[ "$addr" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$addr"
+    return 0
+  fi
+  return 1
+}
+
 find_config_path() {
   if [[ -n "${MIO_ROOT_DIR:-}" ]] && [[ -f "$MIO_ROOT_DIR/conf.yaml" ]]; then
     printf '%s\n' "$MIO_ROOT_DIR/conf.yaml"
@@ -96,15 +108,25 @@ fi
 
 PORT="${MIO_SERVER_PORT:-}"
 if [[ -z "$PORT" ]]; then
-  if [[ -n "${CONFIG_PATH:-}" ]] && PORT=$(extract_port_from_config "$CONFIG_PATH"); then
+  if [[ -n "${MIO_HTTP_ADDR:-}" ]] && PORT=$(extract_port_from_http_addr "$MIO_HTTP_ADDR"); then
+    :
+  elif [[ -n "${MIO_SYSTEM_CONFIG_PORT:-}" ]]; then
+    PORT="$MIO_SYSTEM_CONFIG_PORT"
+  elif [[ -n "${CONFIG_PATH:-}" ]] && PORT=$(extract_port_from_config "$CONFIG_PATH"); then
     :
   else
     PORT="$DEFAULT_PORT"
   fi
 fi
 
+if [[ -n "${MIO_SERVER_PORT:-}" ]]; then
+  export MIO_SYSTEM_CONFIG_PORT="$MIO_SERVER_PORT"
+fi
+
 echo "检查 vtuber-server 端口: $PORT"
 check_and_kill_port "$PORT"
 
+
+rm -rf data/logs/*
 echo "Starting vtuber-server on port $PORT..."
 go run ./cmd

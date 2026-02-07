@@ -2,6 +2,7 @@
 /bin/
 /build/
 /dist/
+data/
 build/
 dist/
 *.exe

@@ -23,6 +23,15 @@ import { useInterrupt } from '@/hooks/utils/use-interrupt';
 import { useBrowser } from '@/context/browser-context';
 import { useMediaCapture } from '@/hooks/utils/use-media-capture';
 
+const isAudioDebugEnabled = () => {
+  if (import.meta.env.VITE_DEBUG_AUDIO === 'true') return true;
+  try {
+    return localStorage.getItem('debugAudio') === '1';
+  } catch {
+    return false;
+  }
+};
+
 const deriveWsUrlFromBase = (baseUrl: string): string | null => {
   try {
     const url = new URL(baseUrl);
@@ -33,6 +42,16 @@ const deriveWsUrlFromBase = (baseUrl: string): string | null => {
     return `${wsProtocol}//${url.host}/client-ws`;
   } catch {
     return null;
+  }
+};
+
+const shouldRewriteWsScheme = (baseUrl: string, wsUrl: string): boolean => {
+  try {
+    const base = new URL(baseUrl);
+    const ws = new URL(wsUrl);
+    return base.host === ws.host;
+  } catch {
+    return true;
   }
 };
 
@@ -56,7 +75,7 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
   const { confUid, setConfName, setConfUid, setConfigFiles } = useConfig();
   const [pendingModelInfo, setPendingModelInfo] = useState<ModelInfo | undefined>(undefined);
   const { setSelfUid, setGroupMembers, setIsOwner } = useGroup();
-  const { startMic, stopMic, autoStartMicOnConvEnd } = useVAD();
+  const { startMic, stopMic, autoStartMicOnConvEnd, voiceInterruptEnabled } = useVAD();
   const autoStartMicOnConvEndRef = useRef(autoStartMicOnConvEnd);
   const { interrupt } = useInterrupt();
   const { setBrowserViewData } = useBrowser();
@@ -72,10 +91,18 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
       const derived = deriveWsUrlFromBase(normalizedBaseUrl);
       return derived || defaultWsUrl;
     }
-    if (normalizedBaseUrl.startsWith('https://') && wsUrl.startsWith('ws://')) {
+    if (
+      normalizedBaseUrl.startsWith('https://') &&
+      wsUrl.startsWith('ws://') &&
+      shouldRewriteWsScheme(normalizedBaseUrl, wsUrl)
+    ) {
       return wsUrl.replace(/^ws:\/\//, 'wss://');
     }
-    if (normalizedBaseUrl.startsWith('http://') && wsUrl.startsWith('wss://')) {
+    if (
+      normalizedBaseUrl.startsWith('http://') &&
+      wsUrl.startsWith('wss://') &&
+      shouldRewriteWsScheme(normalizedBaseUrl, wsUrl)
+    ) {
       return wsUrl.replace(/^wss:\/\//, 'ws://');
     }
     return wsUrl;
@@ -215,7 +242,21 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
         if (aiState === 'interrupted' || aiState === 'listening') {
           console.log('Audio playback intercepted. Sentence:', message.display_text?.text);
         } else {
+          if (!voiceInterruptEnabled) {
+            if (isAudioDebugEnabled()) {
+              console.info('[mic] auto stop (tts playing)');
+            }
+            stopMic('auto');
+          }
           console.log("actions", message.actions);
+          if (isAudioDebugEnabled()) {
+            console.info('[audio] tts chunk', {
+              bytes: (message.audio_pcm || '').length,
+              sampleRate: message.audio_sample_rate || 0,
+              channels: message.audio_channels || 0,
+              sliceLength: message.slice_length || 0,
+            });
+          }
           addAudioTask({
             audioBase64: message.audio || '',
             audioPcmBase64: message.audio_pcm || '',
@@ -321,6 +362,12 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
         break;
       case 'force-new-message':
         setForceNewMessage(true);
+        if (!voiceInterruptEnabled) {
+          if (isAudioDebugEnabled()) {
+            console.info('[mic] auto start (tts finished)');
+          }
+          startMic('auto');
+        }
         break;
       case 'interrupt-signal':
         // Handle forwarded interrupt
@@ -383,6 +430,21 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
   }, [normalizedWsUrl]);
 
   useEffect(() => {
+    const handleBeforeUnload = () => {
+      // Stop reconnect loop and close ws so backend can release XiaoZhi session promptly.
+      wsService.setReconnectEnabled(false);
+      wsService.disconnect();
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    window.addEventListener('pagehide', handleBeforeUnload);
+    return () => {
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+      window.removeEventListener('pagehide', handleBeforeUnload);
+      wsService.setReconnectEnabled(true);
+    };
+  }, []);
+
+  useEffect(() => {
     const stateSubscription = wsService.onStateChange(setWsState);
     const messageSubscription = wsService.onMessage(handleWebSocketMessage);
     return () => {
@@ -390,6 +452,14 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
       messageSubscription.unsubscribe();
     };
   }, [normalizedWsUrl, handleWebSocketMessage]);
+
+  useEffect(() => {
+    if (wsState !== 'OPEN') {
+      return;
+    }
+    const listenMode = voiceInterruptEnabled ? 'realtime' : 'auto';
+    wsService.sendMessage({ type: 'set-listen-mode', listen_mode: listenMode });
+  }, [wsState, voiceInterruptEnabled]);
 
   const webSocketContextValue = useMemo(() => ({
     sendMessage: wsService.sendMessage.bind(wsService),
