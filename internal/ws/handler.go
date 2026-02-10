@@ -23,8 +23,8 @@ import (
 	appconfig "github.com/saker-ai/vtuber-server/internal/config"
 	"github.com/saker-ai/vtuber-server/internal/group"
 	"github.com/saker-ai/vtuber-server/internal/storage"
-	"github.com/saker-ai/vtuber-server/internal/xiaozhi"
 	"github.com/saker-ai/vtuber-server/pkg/audio"
+	"github.com/saker-ai/vtuber-server/pkg/xiaozhi"
 )
 
 // Handler represents a handler.
@@ -108,9 +108,15 @@ type session struct {
 	ttsChunkCount int
 	ttsBytes      int
 	lastTTSLog    time.Time
+
+	listenMu            sync.Mutex
+	listenStartInFlight bool
 }
 
-const ttsChunkDurationMs = 300
+const (
+	ttsChunkDurationMs = 300
+	micTailSilenceMs   = 360
+)
 
 type captureResponse struct {
 	Success  bool
@@ -177,6 +183,7 @@ func (h *Handler) Handle(w http.ResponseWriter, r *http.Request) {
 		ProtocolVersion: h.config.XiaoZhiProtocolVersion,
 		AudioParams: xiaozhi.AudioParams{
 			Format:        h.config.XiaoZhiAudioFormat,
+			OutputFormat:  h.config.XiaoZhiOutputFormat,
 			SampleRate:    h.config.XiaoZhiSampleRate,
 			Channels:      h.config.XiaoZhiChannels,
 			FrameDuration: h.config.XiaoZhiFrameDuration,
@@ -185,6 +192,7 @@ func (h *Handler) Handle(w http.ResponseWriter, r *http.Request) {
 		DeviceID:    fallbackID(h.config.XiaoZhiDeviceID, "mio-device-"+sessionID),
 		ClientID:    fallbackID(h.config.XiaoZhiClientID, "mio-client-"+sessionID),
 		AccessToken: h.config.XiaoZhiAccessToken,
+		FeatureAEC:  h.config.XiaoZhiFeatureAEC,
 	}
 
 	sess := &session{
@@ -280,29 +288,18 @@ func (h *Handler) Handle(w http.ResponseWriter, r *http.Request) {
 		},
 		OnConnected: func() {
 			// Re-establish local state after reconnect.
-			sess.listening = false
-			if sess.listenMode == "manual" {
+			sess.setListening(false)
+			mode := sess.getListenMode()
+			if mode == "manual" {
 				sess.logger.Info("xiaozhi reconnected, manual mode waits for mic trigger",
 					zap.String("session_id", sess.clientUID),
 				)
 				return
 			}
-			if err := sess.xiaozhi.SendListenState(ctx, "start"); err != nil {
-				sess.logger.Warn("xiaozhi listen start on reconnect failed",
-					zap.String("session_id", sess.clientUID),
-					zap.String("mode", sess.listenMode),
-					zap.Error(err),
-				)
-				return
-			}
-			sess.listening = true
-			sess.logger.Info("xiaozhi reconnected and listen primed",
-				zap.String("session_id", sess.clientUID),
-				zap.String("mode", sess.listenMode),
-			)
+			sess.ensureListening(ctx, "reconnect")
 		},
 		OnDisconnected: func(err error) {
-			sess.listening = false
+			sess.setListening(false)
 			sess.logger.Warn("xiaozhi disconnected, reset local listen state",
 				zap.String("session_id", sess.clientUID),
 				zap.Error(err),
@@ -378,6 +375,8 @@ func (s *session) handleIncoming(ctx context.Context, msg incomingMessage) {
 		s.handleCaptureResponse(msg)
 	case "frontend-playback-complete":
 		s.sendJSON(map[string]any{"type": "force-new-message"})
+	case "audio-play-start":
+		return
 	case "fetch-configs":
 		s.handleFetchConfigs(ctx)
 	case "switch-config":
@@ -410,6 +409,116 @@ func (s *session) handleIncoming(ctx context.Context, msg incomingMessage) {
 			zap.String("type", msg.Type),
 		)
 		return
+	}
+}
+
+func (s *session) getListenMode() string {
+	s.listenMu.Lock()
+	mode := s.listenMode
+	s.listenMu.Unlock()
+	return mode
+}
+
+func (s *session) setListenMode(mode string) {
+	s.listenMu.Lock()
+	s.listenMode = mode
+	s.listenMu.Unlock()
+}
+
+func (s *session) isListening() bool {
+	s.listenMu.Lock()
+	listening := s.listening
+	s.listenMu.Unlock()
+	return listening
+}
+
+func (s *session) setListening(listening bool) {
+	s.listenMu.Lock()
+	s.listening = listening
+	if !listening {
+		s.listenStartInFlight = false
+	}
+	s.listenMu.Unlock()
+}
+
+func (s *session) ensureListening(ctx context.Context, reason string) bool {
+	s.listenMu.Lock()
+	mode := s.listenMode
+	if s.listening {
+		s.listenMu.Unlock()
+		return true
+	}
+	if s.listenStartInFlight {
+		s.listenMu.Unlock()
+		return s.waitListeningStartResult(ctx, mode, reason)
+	}
+	s.listenStartInFlight = true
+	s.listenMu.Unlock()
+
+	err := s.xiaozhi.SendListenState(ctx, "start")
+
+	s.listenMu.Lock()
+	s.listenStartInFlight = false
+	if err == nil {
+		s.listening = true
+	}
+	mode = s.listenMode
+	s.listenMu.Unlock()
+
+	if err != nil {
+		s.logger.Warn("xiaozhi listen start failed",
+			zap.String("session_id", s.clientUID),
+			zap.String("mode", mode),
+			zap.String("reason", reason),
+			zap.Error(err),
+		)
+		return false
+	}
+	s.logger.Info("xiaozhi listen start",
+		zap.String("session_id", s.clientUID),
+		zap.String("mode", mode),
+		zap.String("reason", reason),
+	)
+	return true
+}
+
+func (s *session) waitListeningStartResult(ctx context.Context, mode string, reason string) bool {
+	timer := time.NewTimer(300 * time.Millisecond)
+	defer timer.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		s.listenMu.Lock()
+		listening := s.listening
+		inFlight := s.listenStartInFlight
+		mode = s.listenMode
+		s.listenMu.Unlock()
+
+		if listening {
+			return true
+		}
+		if !inFlight {
+			s.logger.Debug("xiaozhi listen start not ready after in-flight wait",
+				zap.String("session_id", s.clientUID),
+				zap.String("mode", mode),
+				zap.String("reason", reason),
+			)
+			return false
+		}
+
+		select {
+		case <-ctx.Done():
+			return false
+		case <-timer.C:
+			s.logger.Debug("xiaozhi listen start wait timeout",
+				zap.String("session_id", s.clientUID),
+				zap.String("mode", mode),
+				zap.String("reason", reason),
+			)
+			return false
+		case <-ticker.C:
+		}
 	}
 }
 
@@ -446,20 +555,23 @@ func (s *session) handleMicAudioPCM(ctx context.Context, audioPCM string, sample
 
 func (s *session) handleMicEnd(ctx context.Context) {
 	s.flushMicBuffer(ctx, true)
-	shouldStop := s.listenMode == "manual"
-	if shouldStop && s.listening {
+	tailSilenceFrames := s.appendMicTailSilence(ctx)
+	mode := s.getListenMode()
+	shouldStop := mode == "manual"
+	if shouldStop && s.isListening() {
 		if err := s.xiaozhi.SendListenState(ctx, "stop"); err == nil {
 			s.logger.Info("xiaozhi listen stop", zap.String("session_id", s.clientUID))
 		} else {
 			s.logger.Warn("xiaozhi listen stop failed", zap.Error(err))
 		}
-		s.listening = false
+		s.setListening(false)
 	}
 	s.logger.Debug("mic end state",
 		zap.String("session_id", s.clientUID),
-		zap.String("listen_mode", s.listenMode),
+		zap.String("listen_mode", mode),
 		zap.Bool("stopped", shouldStop),
-		zap.Bool("listening", s.listening),
+		zap.Bool("listening", s.isListening()),
+		zap.Int("tail_silence_frames", tailSilenceFrames),
 		zap.Int("llm_chars", len(s.llmText)),
 	)
 	s.logger.Info("mic audio end",
@@ -486,13 +598,15 @@ func (s *session) handleSetListenMode(mode string) {
 	}
 	switch mode {
 	case "realtime", "auto", "manual":
-		if s.listenMode != mode {
+		prevMode := s.getListenMode()
+		if prevMode != mode {
 			s.logger.Info("listen mode updated",
 				zap.String("session_id", s.clientUID),
+				zap.String("from", prevMode),
 				zap.String("mode", mode),
 			)
 		}
-		s.listenMode = mode
+		s.setListenMode(mode)
 		s.xiaozhi.SetListenMode(mode)
 	default:
 		s.logger.Warn("invalid listen mode",
@@ -506,13 +620,8 @@ func (s *session) handleMicPCMBytes(ctx context.Context, pcm []byte, sampleRate 
 	if len(pcm) == 0 {
 		return
 	}
-	if !s.listening {
-		if err := s.xiaozhi.SendListenState(ctx, "start"); err != nil {
-			s.logger.Warn("xiaozhi listen start failed", zap.Error(err))
-			return
-		}
-		s.logger.Info("xiaozhi listen start", zap.String("session_id", s.clientUID))
-		s.listening = true
+	if !s.ensureListening(ctx, "mic-audio") {
+		return
 	}
 
 	inputRate := sampleRate
@@ -553,13 +662,13 @@ func (s *session) handleMicPCMBytes(ctx context.Context, pcm []byte, sampleRate 
 			zap.Int("target_channels", s.channels),
 			zap.String("format", s.audioFormat),
 			zap.Bool("resampling", s.resampler != nil),
-			zap.Bool("listening", s.listening),
+			zap.Bool("listening", s.isListening()),
 		)
 		s.micChunkCount = 0
 		s.micBytes = 0
 	}
 
-	if s.audioFormat != "opus" && s.audioFormat != "pcm16" && s.audioFormat != "pcm" {
+	if s.audioFormat != "opus" && s.audioFormat != "pcm16" && s.audioFormat != "pcm" && s.audioFormat != "pcm_s16le" {
 		if !s.unsupportedAudio {
 			s.unsupportedAudio = true
 			s.logger.Warn("unsupported mic audio format",
@@ -719,6 +828,29 @@ func (s *session) flushMicBuffer(ctx context.Context, flush bool) {
 		return
 	}
 	s.processPCMFrames(ctx, flush)
+}
+
+func (s *session) appendMicTailSilence(ctx context.Context) int {
+	if !s.isListening() {
+		return 0
+	}
+	frameSize := s.frameSamples * s.channels
+	if frameSize <= 0 {
+		frameSize = 960 * maxInt(1, s.channels)
+	}
+	frameDuration := s.frameDuration
+	if frameDuration <= 0 {
+		frameDuration = 60
+	}
+	frames := (micTailSilenceMs + frameDuration - 1) / frameDuration
+	if frames <= 0 {
+		frames = 1
+	}
+	silenceFrame := make([]int16, frameSize)
+	for i := 0; i < frames; i++ {
+		s.sendPCMFrame(ctx, silenceFrame)
+	}
+	return frames
 }
 
 func (s *session) handleCaptureResponse(msg incomingMessage) {
@@ -911,21 +1043,8 @@ func (s *session) handleTTS(ctx context.Context, state string, text string) {
 			zap.Int("sample_rate", s.ttsSampleRate),
 			zap.Int("channels", s.ttsChannels),
 		)
-		// Match py-xiaozhi keep-listening behavior:
-		// auto mode re-primes listening after each TTS turn instead of per mic segment.
-		if s.listenMode == "auto" {
-			if err := s.xiaozhi.SendListenState(ctx, "start"); err != nil {
-				s.listening = false
-				s.logger.Warn("xiaozhi listen start after tts stop failed",
-					zap.String("session_id", s.clientUID),
-					zap.Error(err),
-				)
-			} else {
-				s.listening = true
-				s.logger.Info("xiaozhi listen start after tts stop",
-					zap.String("session_id", s.clientUID),
-				)
-			}
+		if s.getListenMode() == "auto" && !s.isListening() {
+			s.ensureListening(ctx, "tts-stop-auto")
 		}
 		s.endConversation()
 	}

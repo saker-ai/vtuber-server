@@ -2,6 +2,14 @@ system_config:
   host: ""
   port: 8101
   xiaozhi_backend_url: "ws://localhost:8002/xiaozhi/v1/"
+  xiaozhi_protocol_version: 2
+  xiaozhi_audio_format: "opus"
+  xiaozhi_output_format: ""
+  xiaozhi_sample_rate: 16000
+  xiaozhi_channels: 1
+  xiaozhi_frame_duration: 20
+  xiaozhi_listen_mode: "auto"
+  xiaozhi_feature_aec: true
   xiaozhi_device_id: "00:1A:2B:3C:4D:5E"
   xiaozhi_client_id: ""
   xiaozhi_access_token: ""

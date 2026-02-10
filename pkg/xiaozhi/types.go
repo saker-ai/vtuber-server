@@ -3,6 +3,7 @@ package xiaozhi
 // AudioParams represents a audioParams.
 type AudioParams struct {
 	Format        string
+	OutputFormat  string
 	SampleRate    int
 	Channels      int
 	FrameDuration int
@@ -17,4 +18,5 @@ type Config struct {
 	DeviceID        string
 	ClientID        string
 	AccessToken     string
+	FeatureAEC      bool
 }

@@ -24,6 +24,7 @@ type SystemConfig struct {
 	XiaoZhiBackendURL      string `mapstructure:"xiaozhi_backend_url"`
 	XiaoZhiProtocolVersion int    `mapstructure:"xiaozhi_protocol_version"`
 	XiaoZhiAudioFormat     string `mapstructure:"xiaozhi_audio_format"`
+	XiaoZhiOutputFormat    string `mapstructure:"xiaozhi_output_format"`
 	XiaoZhiSampleRate      int    `mapstructure:"xiaozhi_sample_rate"`
 	XiaoZhiChannels        int    `mapstructure:"xiaozhi_channels"`
 	XiaoZhiFrameDuration   int    `mapstructure:"xiaozhi_frame_duration"`
@@ -31,6 +32,7 @@ type SystemConfig struct {
 	XiaoZhiDeviceID        string `mapstructure:"xiaozhi_device_id"`
 	XiaoZhiClientID        string `mapstructure:"xiaozhi_client_id"`
 	XiaoZhiAccessToken     string `mapstructure:"xiaozhi_access_token"`
+	XiaoZhiFeatureAEC      bool   `mapstructure:"xiaozhi_feature_aec"`
 }
 
 // CharacterConfig represents a characterConfig.
@@ -49,6 +51,7 @@ type Config struct {
 	XiaoZhiBackendURL      string          `mapstructure:"xiaozhi_backend_url"`
 	XiaoZhiProtocolVersion int             `mapstructure:"xiaozhi_protocol_version"`
 	XiaoZhiAudioFormat     string          `mapstructure:"xiaozhi_audio_format"`
+	XiaoZhiOutputFormat    string          `mapstructure:"xiaozhi_output_format"`
 	XiaoZhiSampleRate      int             `mapstructure:"xiaozhi_sample_rate"`
 	XiaoZhiChannels        int             `mapstructure:"xiaozhi_channels"`
 	XiaoZhiFrameDuration   int             `mapstructure:"xiaozhi_frame_duration"`
@@ -56,6 +59,7 @@ type Config struct {
 	XiaoZhiDeviceID        string          `mapstructure:"xiaozhi_device_id"`
 	XiaoZhiClientID        string          `mapstructure:"xiaozhi_client_id"`
 	XiaoZhiAccessToken     string          `mapstructure:"xiaozhi_access_token"`
+	XiaoZhiFeatureAEC      bool            `mapstructure:"xiaozhi_feature_aec"`
 	ConfigAltsDir          string          `mapstructure:"config_alts_dir"`
 	ModelDictPath          string          `mapstructure:"model_dict_path"`
 	ChatHistoryDir         string          `mapstructure:"chat_history_dir"`
@@ -91,12 +95,14 @@ func Load() (Config, error) {
 	}
 
 	v.SetDefault("http_addr", "")
-	v.SetDefault("xiaozhi_protocol_version", 1)
+	v.SetDefault("xiaozhi_protocol_version", 2)
 	v.SetDefault("xiaozhi_audio_format", "opus")
+	v.SetDefault("xiaozhi_output_format", "")
 	v.SetDefault("xiaozhi_sample_rate", 16000)
 	v.SetDefault("xiaozhi_channels", 1)
 	v.SetDefault("xiaozhi_frame_duration", 20)
 	v.SetDefault("xiaozhi_listen_mode", "auto")
+	v.SetDefault("xiaozhi_feature_aec", true)
 	v.SetDefault("tls_required", false)
 	v.SetDefault("tls_disable", false)
 	v.SetDefault("tls_cert_path", "")
@@ -124,6 +130,9 @@ func Load() (Config, error) {
 	var cfg Config
 	if err := v.Unmarshal(&cfg); err != nil {
 		return Config{}, err
+	}
+	if !isTopLevelXiaoZhiFeatureAECExplicit(v) && isSystemXiaoZhiFeatureAECExplicit(v) {
+		cfg.XiaoZhiFeatureAEC = cfg.SystemConfig.XiaoZhiFeatureAEC
 	}
 
 	cfg.RootDir = rootDir
@@ -163,11 +172,14 @@ func LoadConfig(configPath string) (Config, error) {
 	}
 
 	v.SetDefault("http_addr", "")
-	v.SetDefault("xiaozhi_protocol_version", 1)
+	v.SetDefault("xiaozhi_protocol_version", 2)
 	v.SetDefault("xiaozhi_audio_format", "opus")
+	v.SetDefault("xiaozhi_output_format", "")
 	v.SetDefault("xiaozhi_sample_rate", 16000)
 	v.SetDefault("xiaozhi_channels", 1)
 	v.SetDefault("xiaozhi_frame_duration", 20)
+	v.SetDefault("xiaozhi_listen_mode", "auto")
+	v.SetDefault("xiaozhi_feature_aec", true)
 	v.SetDefault("tls_required", false)
 	v.SetDefault("tls_disable", false)
 	v.SetDefault("tls_cert_path", "")
@@ -185,6 +197,9 @@ func LoadConfig(configPath string) (Config, error) {
 	var cfg Config
 	if err := v.Unmarshal(&cfg); err != nil {
 		return Config{}, err
+	}
+	if !isTopLevelXiaoZhiFeatureAECExplicit(v) && isSystemXiaoZhiFeatureAECExplicit(v) {
+		cfg.XiaoZhiFeatureAEC = cfg.SystemConfig.XiaoZhiFeatureAEC
 	}
 
 	cfg.RootDir = rootDir
@@ -206,6 +221,9 @@ func applySystemConfig(cfg *Config) {
 	}
 	if cfg.XiaoZhiAudioFormat == "" {
 		cfg.XiaoZhiAudioFormat = system.XiaoZhiAudioFormat
+	}
+	if cfg.XiaoZhiOutputFormat == "" {
+		cfg.XiaoZhiOutputFormat = system.XiaoZhiOutputFormat
 	}
 	if cfg.XiaoZhiSampleRate == 0 {
 		cfg.XiaoZhiSampleRate = system.XiaoZhiSampleRate
@@ -244,6 +262,28 @@ func deriveHTTPAddr(cfg *Config) {
 		return
 	}
 	cfg.HTTPAddr = net.JoinHostPort(host, strconv.Itoa(port))
+}
+
+func isTopLevelXiaoZhiFeatureAECExplicit(v *viper.Viper) bool {
+	if v == nil {
+		return false
+	}
+	if v.InConfig("xiaozhi_feature_aec") {
+		return true
+	}
+	_, ok := os.LookupEnv("MIO_XIAOZHI_FEATURE_AEC")
+	return ok
+}
+
+func isSystemXiaoZhiFeatureAECExplicit(v *viper.Viper) bool {
+	if v == nil {
+		return false
+	}
+	if v.InConfig("system_config.xiaozhi_feature_aec") {
+		return true
+	}
+	_, ok := os.LookupEnv("MIO_SYSTEM_CONFIG_XIAOZHI_FEATURE_AEC")
+	return ok
 }
 
 func resolveRootDir() (string, error) {
