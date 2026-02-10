@@ -2,6 +2,8 @@ class PcmPlayer {
   private context: AudioContext;
   private scheduledTime: number;
   private activeSources: Set<AudioBufferSourceNode>;
+  private unlockListenersAttached: boolean;
+  private readonly tryUnlockHandler: () => void;
   private readonly latencySeconds = 0.02;
   private readonly fadeMs = 5;
 
@@ -10,6 +12,11 @@ class PcmPlayer {
     this.context = new AudioContextCtor();
     this.scheduledTime = this.context.currentTime;
     this.activeSources = new Set();
+    this.unlockListenersAttached = false;
+    this.tryUnlockHandler = () => {
+      void this.resumeContext(true);
+    };
+    this.attachUnlockListeners();
   }
 
   async enqueue(
@@ -18,12 +25,12 @@ class PcmPlayer {
     channels: number,
     onEnded?: () => void,
   ): Promise<{ pcm: Int16Array; started: boolean }> {
+    const pcm = this.decodeBase64ToInt16(base64);
     const ready = await this.ensureRunning();
     if (!ready) {
-      return { pcm: new Int16Array(0), started: false };
+      return { pcm, started: false };
     }
 
-    const pcm = this.decodeBase64ToInt16(base64);
     const buffer = this.toAudioBuffer(pcm, sampleRate, channels);
     const source = this.context.createBufferSource();
     source.buffer = buffer;
@@ -92,15 +99,53 @@ class PcmPlayer {
   }
 
   private async ensureRunning(): Promise<boolean> {
-    if (this.context.state === 'running') {
+    return this.resumeContext(false);
+  }
+
+  private async resumeContext(fromUserGesture: boolean): Promise<boolean> {
+    if ((this.context.state as AudioContextState) === 'running') {
+      this.detachUnlockListeners();
       return true;
     }
     try {
       await this.context.resume();
     } catch (error) {
-      console.warn('[PcmPlayer] AudioContext resume failed:', error);
+      if (fromUserGesture) {
+        console.warn('[PcmPlayer] AudioContext resume failed after user gesture:', error);
+      } else {
+        console.warn('[PcmPlayer] AudioContext resume failed:', error);
+      }
     }
-    return this.context.state === 'running';
+
+    if (this.context.state === 'running') {
+      this.detachUnlockListeners();
+      return true;
+    }
+
+    if (!fromUserGesture) {
+      this.attachUnlockListeners();
+    }
+    return false;
+  }
+
+  private attachUnlockListeners() {
+    if (this.unlockListenersAttached) {
+      return;
+    }
+    this.unlockListenersAttached = true;
+    window.addEventListener('pointerdown', this.tryUnlockHandler, { passive: true });
+    window.addEventListener('keydown', this.tryUnlockHandler);
+    window.addEventListener('touchstart', this.tryUnlockHandler, { passive: true });
+  }
+
+  private detachUnlockListeners() {
+    if (!this.unlockListenersAttached) {
+      return;
+    }
+    this.unlockListenersAttached = false;
+    window.removeEventListener('pointerdown', this.tryUnlockHandler);
+    window.removeEventListener('keydown', this.tryUnlockHandler);
+    window.removeEventListener('touchstart', this.tryUnlockHandler);
   }
 
   private decodeBase64ToInt16(base64: string): Int16Array {

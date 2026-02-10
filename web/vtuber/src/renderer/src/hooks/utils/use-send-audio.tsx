@@ -19,7 +19,8 @@ export function useSendAudio() {
   const sendAudioPartition = useCallback(
     async (audio: Float32Array, audioSampleRate: number, audioChannels: number) => {
       const chunkSize = 4096;
-      const endDelayMs = 150;
+      const endDelayMs = 80;
+      const captureTimeoutMs = 400;
       const debug = isAudioDebugEnabled();
       if (debug) {
         console.info("[audio] send mic start", {
@@ -49,10 +50,18 @@ export function useSendAudio() {
       await new Promise((resolve) => setTimeout(resolve, endDelayMs));
 
       // Send end signal after all chunks
-      const images = await captureAllMedia();
+      let images = [];
+      try {
+        images = await Promise.race([
+          captureAllMedia(),
+          new Promise<[]>(resolve => setTimeout(() => resolve([]), captureTimeoutMs)),
+        ]);
+      } catch (error) {
+        console.warn("[audio] capture all media failed:", error);
+      }
       sendMessage({ type: "mic-audio-end", images });
       if (debug) {
-        console.info("[audio] send mic end");
+        console.info("[audio] send mic end", { images: images.length });
       }
     },
     [sendMessage, captureAllMedia],

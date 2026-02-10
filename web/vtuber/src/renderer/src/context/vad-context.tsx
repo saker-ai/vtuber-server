@@ -91,11 +91,51 @@ interface VADState {
 /**
  * Default values and constants
  */
-const DEFAULT_VAD_SETTINGS: VADSettings = {
+const LEGACY_VAD_SETTINGS: VADSettings = {
   positiveSpeechThreshold: 50,
   negativeSpeechThreshold: 35,
   redemptionFrames: 35,
 };
+
+const getDefaultNumber = (
+  value: string | undefined,
+  fallback: number,
+  min: number,
+  max: number,
+): number => {
+  if (value === undefined || value === null || value === '') {
+    return fallback;
+  }
+  const parsed = Number(value);
+  if (Number.isNaN(parsed)) {
+    return fallback;
+  }
+  return Math.min(max, Math.max(min, parsed));
+};
+
+const DEFAULT_VAD_SETTINGS: VADSettings = {
+  positiveSpeechThreshold: getDefaultNumber(
+    import.meta.env.VITE_DEFAULT_POSITIVE_SPEECH_THRESHOLD,
+    42,
+    1,
+    100,
+  ),
+  negativeSpeechThreshold: getDefaultNumber(
+    import.meta.env.VITE_DEFAULT_NEGATIVE_SPEECH_THRESHOLD,
+    28,
+    0,
+    100,
+  ),
+  redemptionFrames: getDefaultNumber(
+    import.meta.env.VITE_DEFAULT_REDEMPTION_FRAMES,
+    16,
+    1,
+    100,
+  ),
+};
+
+const VAD_SETTINGS_VERSION_KEY = 'vadSettingsVersion';
+const VAD_SETTINGS_VERSION = 2;
 
 const VAD_OUTPUT_SAMPLE_RATE = 16000;
 const VAD_OUTPUT_CHANNELS = 1;
@@ -255,6 +295,27 @@ export function VADProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     autoStartOnLoadRef.current = autoStartOnLoad;
   }, [autoStartOnLoad]);
+
+  // One-time migration: if users are still on the old conservative defaults,
+  // move them to the newer responsive defaults.
+  useEffect(() => {
+    try {
+      const version = Number(localStorage.getItem(VAD_SETTINGS_VERSION_KEY) || '0');
+      if (version >= VAD_SETTINGS_VERSION) {
+        return;
+      }
+      const isLegacyDefault =
+        settings.positiveSpeechThreshold === LEGACY_VAD_SETTINGS.positiveSpeechThreshold
+        && settings.negativeSpeechThreshold === LEGACY_VAD_SETTINGS.negativeSpeechThreshold
+        && settings.redemptionFrames === LEGACY_VAD_SETTINGS.redemptionFrames;
+      if (isLegacyDefault) {
+        setSettings(DEFAULT_VAD_SETTINGS);
+      }
+      localStorage.setItem(VAD_SETTINGS_VERSION_KEY, String(VAD_SETTINGS_VERSION));
+    } catch (error) {
+      console.warn('[vad] failed to migrate settings:', error);
+    }
+  }, [settings, setSettings]);
 
   /**
    * Update previous triggered probability and force re-render

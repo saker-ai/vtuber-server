@@ -25,7 +25,8 @@
     "build:linux:appimage:x64": "electron-vite build && electron-builder --linux appimage --x64 --publish=never",
     "build:linux:appimage:arm64": "electron-vite build && electron-builder --linux appimage --arm64 --publish=never",
     "dev:web": "vite serve src/renderer --config vite.config.ts",
-    "build:web": "vite build --config vite.config.ts --mode web",
+    "build:web": "vite build --config vite.config.ts --mode web && npm run sync:webassets",
+    "sync:webassets": "node ./scripts/sync-webassets.mjs",
     "extract-translations": "i18next-scanner --config i18next-scanner.config.js"
   },
   "dependencies": {

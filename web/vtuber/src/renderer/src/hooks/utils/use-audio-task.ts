@@ -176,8 +176,48 @@ export const useAudioTask = () => {
         // Register with global audio manager IMMEDIATELY after creating audio
         audioManager.setCurrentAudio(audio, model);
         let isFinished = false;
+        let retryHandlerAttached = false;
+        let retryTimeoutId: number | null = null;
+
+        const retryPlayOnGesture = () => {
+          audio.play().catch((retryError) => {
+            console.error('Audio play retry error:', retryError);
+            cleanup();
+          });
+        };
+
+        const clearRetryTimeout = () => {
+          if (retryTimeoutId !== null) {
+            window.clearTimeout(retryTimeoutId);
+            retryTimeoutId = null;
+          }
+        };
+
+        const attachRetryHandler = () => {
+          if (retryHandlerAttached) {
+            return;
+          }
+          retryHandlerAttached = true;
+          window.addEventListener('pointerdown', retryPlayOnGesture, { once: true, passive: true });
+          window.addEventListener('keydown', retryPlayOnGesture, { once: true });
+          retryTimeoutId = window.setTimeout(() => {
+            console.warn('Audio autoplay retry timed out.');
+            cleanup();
+          }, 5_000);
+        };
+
+        const detachRetryHandler = () => {
+          if (!retryHandlerAttached) {
+            return;
+          }
+          retryHandlerAttached = false;
+          window.removeEventListener('pointerdown', retryPlayOnGesture);
+          window.removeEventListener('keydown', retryPlayOnGesture);
+          clearRetryTimeout();
+        };
 
         const cleanup = () => {
+          detachRetryHandler();
           audioManager.clearCurrentAudio(audio);
           if (!isFinished) {
             isFinished = true;
@@ -199,6 +239,11 @@ export const useAudioTask = () => {
           console.log('Starting audio playback with lip sync');
           audio.play().catch((err) => {
             console.error("Audio play error:", err);
+            if ((err as DOMException)?.name === 'NotAllowedError') {
+              console.warn('Audio playback blocked by autoplay policy, waiting for user gesture.');
+              attachRetryHandler();
+              return;
+            }
             cleanup();
           });
 
@@ -305,7 +350,15 @@ export const useAudioTask = () => {
         );
 
         if (!enqueueResult.started) {
+          console.warn('PCM playback not started, falling back to WAV audio element playback.');
           audioManager.clearCurrentAudio(audioHandle);
+          if (enqueueResult.pcm.length > 0) {
+            const fallbackBlob = pcmPlayer.makeWavBlob(enqueueResult.pcm, rate, channels);
+            const fallbackUrl = URL.createObjectURL(fallbackBlob);
+            playWavAudio(fallbackUrl);
+            setTimeout(() => URL.revokeObjectURL(fallbackUrl), 30_000);
+            return;
+          }
           if (audioBase64) {
             playWavAudio(`data:audio/wav;base64,${audioBase64}`);
             return;
