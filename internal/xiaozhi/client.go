@@ -25,14 +25,16 @@ type AudioFrame struct {
 
 // Callbacks represents a callbacks.
 type Callbacks struct {
-	OnSTT     func(text string)
-	OnLLM     func(text string, state string)
-	OnText    func(text string)
-	OnTTS     func(state string, text string)
-	OnMCP     func(payload json.RawMessage)
-	OnGoodbye func()
-	OnAudio   func(frame AudioFrame)
-	OnError   func(err error)
+	OnSTT          func(text string)
+	OnLLM          func(text string, state string)
+	OnText         func(text string)
+	OnTTS          func(state string, text string)
+	OnMCP          func(payload json.RawMessage)
+	OnGoodbye      func()
+	OnAudio        func(frame AudioFrame)
+	OnConnected    func()
+	OnDisconnected func(err error)
+	OnError        func(err error)
 }
 
 // Client represents a client.
@@ -214,8 +216,14 @@ func (c *Client) run(ctx context.Context) {
 			zap.String("device_id", c.cfg.DeviceID),
 			zap.String("client_id", c.cfg.ClientID),
 		)
+		if c.callbacks.OnConnected != nil {
+			c.callbacks.OnConnected()
+		}
 		delay = time.Second
 		if err := c.readLoop(); err != nil {
+			if c.callbacks.OnDisconnected != nil {
+				c.callbacks.OnDisconnected(err)
+			}
 			c.reportError(err)
 			c.logger.Warn("xiaozhi connection lost", zap.Error(err))
 			time.Sleep(delay)

@@ -262,7 +262,7 @@ func (h *Handler) Handle(w http.ResponseWriter, r *http.Request) {
 				zap.String("state", state),
 				zap.Int("chars", len(text)),
 			)
-			sess.handleTTS(state, text)
+			sess.handleTTS(ctx, state, text)
 		},
 		OnMCP: func(payload json.RawMessage) {
 			sess.logger.Debug("xiaozhi mcp",
@@ -277,6 +277,36 @@ func (h *Handler) Handle(w http.ResponseWriter, r *http.Request) {
 		},
 		OnAudio: func(frame xiaozhi.AudioFrame) {
 			sess.handleAudio(frame)
+		},
+		OnConnected: func() {
+			// Re-establish local state after reconnect.
+			sess.listening = false
+			if sess.listenMode == "manual" {
+				sess.logger.Info("xiaozhi reconnected, manual mode waits for mic trigger",
+					zap.String("session_id", sess.clientUID),
+				)
+				return
+			}
+			if err := sess.xiaozhi.SendListenState(ctx, "start"); err != nil {
+				sess.logger.Warn("xiaozhi listen start on reconnect failed",
+					zap.String("session_id", sess.clientUID),
+					zap.String("mode", sess.listenMode),
+					zap.Error(err),
+				)
+				return
+			}
+			sess.listening = true
+			sess.logger.Info("xiaozhi reconnected and listen primed",
+				zap.String("session_id", sess.clientUID),
+				zap.String("mode", sess.listenMode),
+			)
+		},
+		OnDisconnected: func(err error) {
+			sess.listening = false
+			sess.logger.Warn("xiaozhi disconnected, reset local listen state",
+				zap.String("session_id", sess.clientUID),
+				zap.Error(err),
+			)
 		},
 		OnError: func(err error) {
 			sess.logger.Warn("xiaozhi error", zap.Error(err))
@@ -416,7 +446,8 @@ func (s *session) handleMicAudioPCM(ctx context.Context, audioPCM string, sample
 
 func (s *session) handleMicEnd(ctx context.Context) {
 	s.flushMicBuffer(ctx, true)
-	if s.listening {
+	shouldStop := s.listenMode == "manual"
+	if shouldStop && s.listening {
 		if err := s.xiaozhi.SendListenState(ctx, "stop"); err == nil {
 			s.logger.Info("xiaozhi listen stop", zap.String("session_id", s.clientUID))
 		} else {
@@ -426,6 +457,9 @@ func (s *session) handleMicEnd(ctx context.Context) {
 	}
 	s.logger.Debug("mic end state",
 		zap.String("session_id", s.clientUID),
+		zap.String("listen_mode", s.listenMode),
+		zap.Bool("stopped", shouldStop),
+		zap.Bool("listening", s.listening),
 		zap.Int("llm_chars", len(s.llmText)),
 	)
 	s.logger.Info("mic audio end",
@@ -473,11 +507,11 @@ func (s *session) handleMicPCMBytes(ctx context.Context, pcm []byte, sampleRate 
 		return
 	}
 	if !s.listening {
-		if err := s.xiaozhi.SendListenState(ctx, "start"); err == nil {
-			s.logger.Info("xiaozhi listen start", zap.String("session_id", s.clientUID))
-		} else {
+		if err := s.xiaozhi.SendListenState(ctx, "start"); err != nil {
 			s.logger.Warn("xiaozhi listen start failed", zap.Error(err))
+			return
 		}
+		s.logger.Info("xiaozhi listen start", zap.String("session_id", s.clientUID))
 		s.listening = true
 	}
 
@@ -843,7 +877,7 @@ func (s *session) endConversation() {
 	s.sendJSON(map[string]any{"type": "control", "text": "conversation-chain-end"})
 }
 
-func (s *session) handleTTS(state string, text string) {
+func (s *session) handleTTS(ctx context.Context, state string, text string) {
 	switch state {
 	case "sentence_start":
 		if text == "" {
@@ -877,6 +911,22 @@ func (s *session) handleTTS(state string, text string) {
 			zap.Int("sample_rate", s.ttsSampleRate),
 			zap.Int("channels", s.ttsChannels),
 		)
+		// Match py-xiaozhi keep-listening behavior:
+		// auto mode re-primes listening after each TTS turn instead of per mic segment.
+		if s.listenMode == "auto" {
+			if err := s.xiaozhi.SendListenState(ctx, "start"); err != nil {
+				s.listening = false
+				s.logger.Warn("xiaozhi listen start after tts stop failed",
+					zap.String("session_id", s.clientUID),
+					zap.Error(err),
+				)
+			} else {
+				s.listening = true
+				s.logger.Info("xiaozhi listen start after tts stop",
+					zap.String("session_id", s.clientUID),
+				)
+			}
+		}
 		s.endConversation()
 	}
 }
