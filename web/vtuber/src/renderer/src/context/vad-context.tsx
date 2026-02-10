@@ -86,6 +86,21 @@ interface VADState {
 
   /** Set auto start microphone on page load */
   setAutoStartOnLoad: (value: boolean) => void;
+
+  /** Continuous mic upstream mode (default enabled) */
+  continuousStreamingEnabled: boolean;
+
+  /** Set continuous mic upstream mode */
+  setContinuousStreamingEnabled: (value: boolean) => void;
+}
+
+interface ContinuousMicUpstream {
+  stream: MediaStream;
+  context: AudioContext;
+  source: MediaStreamAudioSourceNode;
+  processor: ScriptProcessorNode;
+  zeroGain: GainNode;
+  sampleRate: number;
 }
 
 /**
@@ -172,12 +187,17 @@ const getDefaultVADState = () => {
     import.meta.env.VITE_DEFAULT_AUTO_START_MIC_ON_CONV_END,
     false,
   );
+  const defaultContinuousStreamingEnabled = getDefaultBoolean(
+    import.meta.env.VITE_CONTINUOUS_STREAMING_MODE,
+    true,
+  );
   return {
     micOn: defaultMicOn,
     autoStopMic: false,
     autoStartMicOn: false,
     autoStartMicOnConvEnd: defaultAutoStartMicOnConvEnd,
     voiceInterruptEnabled: false,
+    continuousStreamingEnabled: defaultContinuousStreamingEnabled,
   };
 };
 
@@ -228,6 +248,12 @@ export function VADProvider({ children }: { children: React.ReactNode }) {
     DEFAULT_VAD_STATE.voiceInterruptEnabled,
   );
   const voiceInterruptEnabledRef = useRef(false);
+  const [continuousStreamingEnabled, setContinuousStreamingEnabledState] = useLocalStorage(
+    'continuousStreamingEnabled',
+    DEFAULT_VAD_STATE.continuousStreamingEnabled,
+  );
+  const continuousStreamingEnabledRef = useRef(DEFAULT_VAD_STATE.continuousStreamingEnabled);
+  const continuousStreamingRuntimeRef = useRef(DEFAULT_VAD_STATE.continuousStreamingEnabled);
   const [autoStartOnLoad, setAutoStartOnLoadState] = useLocalStorage(
     'autoStartOnLoad',
     true,
@@ -239,14 +265,17 @@ export function VADProvider({ children }: { children: React.ReactNode }) {
 
   // External hooks and contexts
   const { interrupt } = useInterrupt();
-  const { sendAudioPartition } = useSendAudio();
+  const { sendAudioPartition, sendMicAudioChunk, sendMicAudioEnd } = useSendAudio();
   const { setSubtitleText } = useContext(SubtitleContext)!;
   const { aiState, setAiState } = useContext(AiStateContext)!;
 
   // Refs for callback stability
   const interruptRef = useRef(interrupt);
   const sendAudioPartitionRef = useRef(sendAudioPartition);
+  const sendMicAudioChunkRef = useRef(sendMicAudioChunk);
+  const sendMicAudioEndRef = useRef(sendMicAudioEnd);
   const aiStateRef = useRef<AiState>(aiState);
+  const micOnRef = useRef(micOn);
   const setSubtitleTextRef = useRef(setSubtitleText);
   const setAiStateRef = useRef(setAiState);
 
@@ -254,11 +283,16 @@ export function VADProvider({ children }: { children: React.ReactNode }) {
   const autoStartAttemptedRef = useRef(false);
   const startInFlightRef = useRef(false);
   const gestureStartHandlerRef = useRef<(() => void) | null>(null);
+  const continuousMicUpstreamRef = useRef<ContinuousMicUpstream | null>(null);
 
   // Update refs when dependencies change
   useEffect(() => {
     aiStateRef.current = aiState;
   }, [aiState]);
+
+  useEffect(() => {
+    micOnRef.current = micOn;
+  }, [micOn]);
 
   useEffect(() => {
     interruptRef.current = interrupt;
@@ -267,6 +301,14 @@ export function VADProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     sendAudioPartitionRef.current = sendAudioPartition;
   }, [sendAudioPartition]);
+
+  useEffect(() => {
+    sendMicAudioChunkRef.current = sendMicAudioChunk;
+  }, [sendMicAudioChunk]);
+
+  useEffect(() => {
+    sendMicAudioEndRef.current = sendMicAudioEnd;
+  }, [sendMicAudioEnd]);
 
   useEffect(() => {
     setSubtitleTextRef.current = setSubtitleText;
@@ -291,6 +333,11 @@ export function VADProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     voiceInterruptEnabledRef.current = voiceInterruptEnabled;
   }, [voiceInterruptEnabled]);
+
+  useEffect(() => {
+    continuousStreamingEnabledRef.current = continuousStreamingEnabled;
+    continuousStreamingRuntimeRef.current = continuousStreamingEnabled;
+  }, [continuousStreamingEnabled]);
 
   useEffect(() => {
     autoStartOnLoadRef.current = autoStartOnLoad;
@@ -324,6 +371,114 @@ export function VADProvider({ children }: { children: React.ReactNode }) {
     previousTriggeredProbabilityRef.current = value;
     forceUpdate();
   }, []);
+
+  const shouldSendContinuousAudio = useCallback(() => {
+    if (!continuousStreamingRuntimeRef.current || !micOnRef.current) {
+      return false;
+    }
+    if (aiStateRef.current === 'interrupted') {
+      return false;
+    }
+    if (aiStateRef.current === 'thinking-speaking' && !voiceInterruptEnabledRef.current) {
+      return false;
+    }
+    return true;
+  }, []);
+
+  const stopContinuousMicUpstream = useCallback((emitMicEnd: boolean) => {
+    const upstream = continuousMicUpstreamRef.current;
+    if (!upstream) {
+      return;
+    }
+    continuousMicUpstreamRef.current = null;
+    upstream.processor.onaudioprocess = null;
+    try {
+      upstream.source.disconnect();
+      upstream.processor.disconnect();
+      upstream.zeroGain.disconnect();
+    } catch (error) {
+      console.warn('[audio] failed to disconnect continuous upstream nodes', error);
+    }
+    upstream.stream.getTracks().forEach((track) => track.stop());
+    void upstream.context.close().catch((error) => {
+      console.warn('[audio] failed to close continuous upstream context', error);
+    });
+    if (emitMicEnd && continuousStreamingRuntimeRef.current) {
+      void sendMicAudioEndRef.current(false);
+    }
+  }, []);
+
+  const startContinuousMicUpstream = useCallback(async () => {
+    if (!continuousStreamingEnabledRef.current || continuousMicUpstreamRef.current) {
+      return true;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          sampleRate: VAD_OUTPUT_SAMPLE_RATE,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+        video: false,
+      });
+      const AudioContextCtor = window.AudioContext
+        || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+      if (!AudioContextCtor) {
+        throw new Error('AudioContext is not supported');
+      }
+      const context = new AudioContextCtor();
+      if (context.state === 'suspended') {
+        await context.resume().catch(() => {});
+      }
+      const source = context.createMediaStreamSource(stream);
+      const processor = context.createScriptProcessor(4096, 1, 1);
+      const zeroGain = context.createGain();
+      zeroGain.gain.value = 0;
+
+      processor.onaudioprocess = (event) => {
+        if (!shouldSendContinuousAudio()) {
+          return;
+        }
+        const input = event.inputBuffer.getChannelData(0);
+        if (!input || input.length === 0) {
+          return;
+        }
+        const chunk = input.slice();
+        sendMicAudioChunkRef.current(chunk, context.sampleRate, 1);
+      };
+
+      source.connect(processor);
+      processor.connect(zeroGain);
+      zeroGain.connect(context.destination);
+
+      continuousMicUpstreamRef.current = {
+        stream,
+        context,
+        source,
+        processor,
+        zeroGain,
+        sampleRate: context.sampleRate,
+      };
+      if (isAudioDebugEnabled()) {
+        console.info('[audio] continuous upstream started', {
+          sampleRate: context.sampleRate,
+          channels: 1,
+          bufferSize: 4096,
+        });
+      }
+      return true;
+    } catch (error) {
+      console.warn('[audio] failed to start continuous upstream, fallback to utterance mode', error);
+      toaster.create({
+        title: `${t('error.failedStartVAD')}: ${error}`,
+        type: 'warning',
+        duration: 2500,
+      });
+      return false;
+    }
+  }, [shouldSendContinuousAudio, t]);
 
   /**
    * Handle speech start event (initial detection)
@@ -412,9 +567,13 @@ const handleSpeechEnd = useCallback((audio: Float32Array) => {
     }
 
     setPreviousTriggeredProbability(0);
-    sendAudioPartitionRef.current(audio, VAD_OUTPUT_SAMPLE_RATE, VAD_OUTPUT_CHANNELS);
+    if (!continuousStreamingRuntimeRef.current) {
+      sendAudioPartitionRef.current(audio, VAD_OUTPUT_SAMPLE_RATE, VAD_OUTPUT_CHANNELS);
+    } else if (isAudioDebugEnabled()) {
+      console.info('[audio] speech end on continuous mode, skip utterance upload');
+    }
     isProcessingRef.current = false;
-    setAiStateRef.current("thinking-speaking");
+    setAiStateRef.current('thinking-speaking');
   }, []);
 
   /**
@@ -455,7 +614,7 @@ const initVAD = async () => {
       console.info('[vad] init');
     }
     const newVAD = await MicVAD.new({
-      model: "v5",
+      model: 'v5',
       preSpeechPadFrames: 20,
       positiveSpeechThreshold: settings.positiveSpeechThreshold / 100,
       negativeSpeechThreshold: settings.negativeSpeechThreshold / 100,
@@ -489,6 +648,15 @@ const startMic = useCallback(async (source: 'auto' | 'user' = 'user') => {
       } else {
         console.log('Starting VAD');
         vadRef.current.start();
+      }
+      continuousStreamingRuntimeRef.current = continuousStreamingEnabledRef.current;
+      if (continuousStreamingEnabledRef.current) {
+        const started = await startContinuousMicUpstream();
+        if (!started) {
+          continuousStreamingRuntimeRef.current = false;
+        }
+      } else {
+        stopContinuousMicUpstream(false);
       }
       setMicOn(true);
       if (source === 'user') {
@@ -524,7 +692,7 @@ const startMic = useCallback(async (source: 'auto' | 'user' = 'user') => {
     } finally {
       startInFlightRef.current = false;
     }
-  }, [t]);
+  }, [startContinuousMicUpstream, stopContinuousMicUpstream, t]);
 
   // Attempt auto-start on initial load if mic is persisted as on.
   useEffect(() => {
@@ -552,6 +720,10 @@ const startMic = useCallback(async (source: 'auto' | 'user' = 'user') => {
     };
   }, [micOn, startMic]);
 
+  useEffect(() => () => {
+    stopContinuousMicUpstream(false);
+  }, [stopContinuousMicUpstream]);
+
   /**
    * Stop microphone and VAD processing
    */
@@ -569,12 +741,14 @@ const stopMic = useCallback((source: 'system' | 'user' = 'system') => {
     } else {
       console.log('VAD instance not found');
     }
+    stopContinuousMicUpstream(true);
+    continuousStreamingRuntimeRef.current = false;
     setMicOn(false);
     if (source === 'user') {
       setAutoStartOnLoadState(false);
     }
     isProcessingRef.current = false;
-  }, []);
+  }, [stopContinuousMicUpstream]);
 
   /**
    * Set Auto stop mic state
@@ -603,6 +777,26 @@ const stopMic = useCallback((source: 'system' | 'user' = 'system') => {
     forceUpdate();
   }, []);
 
+  const setContinuousStreamingEnabled = useCallback((value: boolean) => {
+    continuousStreamingEnabledRef.current = value;
+    continuousStreamingRuntimeRef.current = value;
+    setContinuousStreamingEnabledState(value);
+    forceUpdate();
+    if (!micOnRef.current) {
+      return;
+    }
+    if (value) {
+      void startContinuousMicUpstream().then((started) => {
+        if (!started) {
+          continuousStreamingRuntimeRef.current = false;
+          forceUpdate();
+        }
+      });
+    } else {
+      stopContinuousMicUpstream(false);
+    }
+  }, [setContinuousStreamingEnabledState, startContinuousMicUpstream, stopContinuousMicUpstream]);
+
   const setAutoStartOnLoad = useCallback((value: boolean) => {
     autoStartOnLoadRef.current = value;
     setAutoStartOnLoadState(value);
@@ -628,6 +822,8 @@ const stopMic = useCallback((source: 'system' | 'user' = 'system') => {
       setAutoStartMicOnConvEnd,
       voiceInterruptEnabled: voiceInterruptEnabledRef.current,
       setVoiceInterruptEnabled,
+      continuousStreamingEnabled: continuousStreamingEnabledRef.current,
+      setContinuousStreamingEnabled,
       autoStartOnLoad: autoStartOnLoadRef.current,
       setAutoStartOnLoad,
     }),
@@ -639,6 +835,8 @@ const stopMic = useCallback((source: 'system' | 'user' = 'system') => {
       updateSettings,
       voiceInterruptEnabled,
       setVoiceInterruptEnabled,
+      continuousStreamingEnabled,
+      setContinuousStreamingEnabled,
       setAutoStartOnLoad,
     ],
   );

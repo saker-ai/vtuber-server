@@ -75,7 +75,13 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
   const { confUid, setConfName, setConfUid, setConfigFiles } = useConfig();
   const [pendingModelInfo, setPendingModelInfo] = useState<ModelInfo | undefined>(undefined);
   const { setSelfUid, setGroupMembers, setIsOwner } = useGroup();
-  const { startMic, stopMic, autoStartMicOnConvEnd, voiceInterruptEnabled } = useVAD();
+  const {
+    startMic,
+    stopMic,
+    autoStartMicOnConvEnd,
+    voiceInterruptEnabled,
+    continuousStreamingEnabled,
+  } = useVAD();
   const autoStartMicOnConvEndRef = useRef(autoStartMicOnConvEnd);
   const { interrupt } = useInterrupt();
   const { setBrowserViewData } = useBrowser();
@@ -242,11 +248,11 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
         if (aiState === 'interrupted' || aiState === 'listening') {
           console.log('Audio playback intercepted. Sentence:', message.display_text?.text);
         } else {
-          if (!voiceInterruptEnabled) {
+          if (!voiceInterruptEnabled && !continuousStreamingEnabled) {
             if (isAudioDebugEnabled()) {
               console.info('[mic] auto stop (tts playing)');
             }
-            stopMic('auto');
+            stopMic('system');
           }
           console.log("actions", message.actions);
           if (isAudioDebugEnabled()) {
@@ -362,7 +368,7 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
         break;
       case 'force-new-message':
         setForceNewMessage(true);
-        if (!voiceInterruptEnabled) {
+        if (!voiceInterruptEnabled && !continuousStreamingEnabled) {
           if (isAudioDebugEnabled()) {
             console.info('[mic] auto start (tts finished)');
           }
@@ -423,7 +429,7 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
       default:
         console.warn('Unknown message type:', message.type);
     }
-  }, [aiState, addAudioTask, appendHumanMessage, baseUrl, bgUrlContext, setAiState, setConfName, setConfUid, setConfigFiles, setCurrentHistoryUid, setHistoryList, setMessages, setModelInfo, setSubtitleText, startMic, stopMic, setSelfUid, setGroupMembers, setIsOwner, backendSynthComplete, setBackendSynthComplete, clearResponse, handleControlMessage, appendOrUpdateToolCallMessage, upsertAIMessage, interrupt, setBrowserViewData, t, captureCamera, captureScreen]);
+  }, [aiState, addAudioTask, appendHumanMessage, baseUrl, bgUrlContext, setAiState, setConfName, setConfUid, setConfigFiles, setCurrentHistoryUid, setHistoryList, setMessages, setModelInfo, setSubtitleText, startMic, stopMic, setSelfUid, setGroupMembers, setIsOwner, backendSynthComplete, setBackendSynthComplete, clearResponse, handleControlMessage, appendOrUpdateToolCallMessage, upsertAIMessage, interrupt, setBrowserViewData, t, captureCamera, captureScreen, voiceInterruptEnabled, continuousStreamingEnabled]);
 
   useEffect(() => {
     wsService.connect(normalizedWsUrl);

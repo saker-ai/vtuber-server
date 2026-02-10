@@ -1,29 +1,71 @@
-import { useCallback } from "react";
-import { useWebSocket } from "@/context/websocket-context";
-import { useMediaCapture } from "@/hooks/utils/use-media-capture";
-import { float32ToPCM16, pcm16ToBase64 } from "@/utils/pcm-encoder";
+import { useCallback } from 'react';
+import { useWebSocket } from '@/context/websocket-context';
+import { useMediaCapture } from '@/hooks/utils/use-media-capture';
+import { float32ToPCM16, pcm16ToBase64 } from '@/utils/pcm-encoder';
 
 const isAudioDebugEnabled = () => {
-  if (import.meta.env.VITE_DEBUG_AUDIO === "true") return true;
+  if (import.meta.env.VITE_DEBUG_AUDIO === 'true') return true;
   try {
-    return localStorage.getItem("debugAudio") === "1";
+    return localStorage.getItem('debugAudio') === '1';
   } catch {
     return false;
   }
 };
 
 export function useSendAudio() {
-  const { sendMessage } = useWebSocket();
+  const { sendMessage, wsState } = useWebSocket();
   const { captureAllMedia } = useMediaCapture();
+
+  const sendMicAudioChunk = useCallback(
+    (audio: Float32Array, audioSampleRate: number, audioChannels: number) => {
+      if (!audio.length || wsState !== 'OPEN') {
+        return;
+      }
+      const pcm = float32ToPCM16(audio);
+      const base64 = pcm16ToBase64(pcm);
+      sendMessage({
+        type: 'mic-audio-data',
+        audio_pcm: base64,
+        audio_format: 'pcm16',
+        audio_sample_rate: audioSampleRate,
+        audio_channels: audioChannels,
+      });
+    },
+    [sendMessage, wsState],
+  );
+
+  const sendMicAudioEnd = useCallback(
+    async (includeImages = false) => {
+      if (wsState !== 'OPEN') {
+        return;
+      }
+      const captureTimeoutMs = 400;
+      let images: unknown[] = [];
+      if (includeImages) {
+        try {
+          images = await Promise.race([
+            captureAllMedia(),
+            new Promise<[]>(resolve => setTimeout(() => resolve([]), captureTimeoutMs)),
+          ]);
+        } catch (error) {
+          console.warn('[audio] capture all media failed:', error);
+        }
+      }
+      sendMessage({ type: 'mic-audio-end', images });
+      if (isAudioDebugEnabled()) {
+        console.info('[audio] send mic end', { images: images.length });
+      }
+    },
+    [captureAllMedia, sendMessage, wsState],
+  );
 
   const sendAudioPartition = useCallback(
     async (audio: Float32Array, audioSampleRate: number, audioChannels: number) => {
       const chunkSize = 4096;
       const endDelayMs = 80;
-      const captureTimeoutMs = 400;
       const debug = isAudioDebugEnabled();
       if (debug) {
-        console.info("[audio] send mic start", {
+        console.info('[audio] send mic start', {
           frames: audio.length,
           sampleRate: audioSampleRate,
           channels: audioChannels,
@@ -34,40 +76,20 @@ export function useSendAudio() {
       for (let index = 0; index < audio.length; index += chunkSize) {
         const endIndex = Math.min(index + chunkSize, audio.length);
         const chunk = audio.slice(index, endIndex);
-        const pcm = float32ToPCM16(chunk);
-        const base64 = pcm16ToBase64(pcm);
-        sendMessage({
-          type: "mic-audio-data",
-          audio_pcm: base64,
-          audio_format: "pcm16",
-          audio_sample_rate: audioSampleRate,
-          audio_channels: audioChannels,
-          // Only send images with first chunk
-        });
+        sendMicAudioChunk(chunk, audioSampleRate, audioChannels);
       }
 
       // Allow in-flight frames to flush before signaling end
       await new Promise((resolve) => setTimeout(resolve, endDelayMs));
 
-      // Send end signal after all chunks
-      let images = [];
-      try {
-        images = await Promise.race([
-          captureAllMedia(),
-          new Promise<[]>(resolve => setTimeout(() => resolve([]), captureTimeoutMs)),
-        ]);
-      } catch (error) {
-        console.warn("[audio] capture all media failed:", error);
-      }
-      sendMessage({ type: "mic-audio-end", images });
-      if (debug) {
-        console.info("[audio] send mic end", { images: images.length });
-      }
+      await sendMicAudioEnd(true);
     },
-    [sendMessage, captureAllMedia],
+    [sendMicAudioChunk, sendMicAudioEnd],
   );
 
   return {
     sendAudioPartition,
+    sendMicAudioChunk,
+    sendMicAudioEnd,
   };
 }
