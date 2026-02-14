@@ -2,6 +2,7 @@ import { useCallback } from 'react';
 import { useWebSocket } from '@/context/websocket-context';
 import { useMediaCapture } from '@/hooks/utils/use-media-capture';
 import { float32ToPCM16, pcm16ToBase64 } from '@/utils/pcm-encoder';
+import { wsService } from '@/services/websocket-service';
 
 const isAudioDebugEnabled = () => {
   if (import.meta.env.VITE_DEBUG_AUDIO === 'true') return true;
@@ -13,12 +14,12 @@ const isAudioDebugEnabled = () => {
 };
 
 export function useSendAudio() {
-  const { sendMessage, wsState } = useWebSocket();
+  const { sendMessage } = useWebSocket();
   const { captureAllMedia } = useMediaCapture();
 
   const sendMicAudioChunk = useCallback(
     (audio: Float32Array, audioSampleRate: number, audioChannels: number) => {
-      if (!audio.length || wsState !== 'OPEN') {
+      if (!audio.length || wsService.getCurrentState() !== 'OPEN') {
         return;
       }
       const pcm = float32ToPCM16(audio);
@@ -31,12 +32,12 @@ export function useSendAudio() {
         audio_channels: audioChannels,
       });
     },
-    [sendMessage, wsState],
+    [sendMessage],
   );
 
   const sendMicAudioEnd = useCallback(
     async (includeImages = false) => {
-      if (wsState !== 'OPEN') {
+      if (wsService.getCurrentState() !== 'OPEN') {
         return;
       }
       const captureTimeoutMs = 400;
@@ -56,7 +57,7 @@ export function useSendAudio() {
         console.info('[audio] send mic end', { images: images.length });
       }
     },
-    [captureAllMedia, sendMessage, wsState],
+    [captureAllMedia, sendMessage],
   );
 
   const sendAudioPartition = useCallback(

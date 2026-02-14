@@ -13,24 +13,12 @@ import (
 	godepsopus "github.com/godeps/opus"
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
+
+	xzcodec "github.com/saker-ai/vtuber-server/internal/transport/xiaozhi/codec"
 )
 
 const (
 	opusMaxFrameDurationMs = 120
-
-	protocolV1 = 1
-	protocolV2 = 2
-	protocolV3 = 3
-
-	binaryPayloadTypeAudio = 0
-	binaryPayloadTypeCmd   = 1
-)
-
-type binaryPayloadKind int
-
-const (
-	binaryPayloadKindAudio binaryPayloadKind = iota
-	binaryPayloadKindCmd
 )
 
 // AudioFrame represents a audioFrame.
@@ -195,7 +183,7 @@ func (c *Client) SendAudio(ctx context.Context, audio []byte) error {
 		return errors.New("xiaozhi connection not ready")
 	}
 
-	frame := packBinaryPayload(version, audio)
+	frame := xzcodec.Pack(version, audio)
 
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
@@ -452,7 +440,7 @@ func (c *Client) readLoop() error {
 			if len(payload) == 0 {
 				continue
 			}
-			if kind == binaryPayloadKindCmd {
+			if kind == xzcodec.PayloadKindCommand {
 				c.handleTextMessage(payload)
 				continue
 			}
@@ -461,87 +449,8 @@ func (c *Client) readLoop() error {
 	}
 }
 
-func (c *Client) decodeBinaryPayload(frame []byte) ([]byte, binaryPayloadKind, error) {
-	switch c.getProtocolVersion() {
-	case protocolV2:
-		return decodeBinaryProtocol2(frame)
-	case protocolV3:
-		return decodeBinaryProtocol3(frame)
-	default:
-		return frame, binaryPayloadKindAudio, nil
-	}
-}
-
-func decodeBinaryProtocol2(frame []byte) ([]byte, binaryPayloadKind, error) {
-	const headerSize = 16
-	if len(frame) < headerSize {
-		return nil, binaryPayloadKindAudio, errors.New("xiaozhi binary v2 frame too short")
-	}
-	msgType := binary.BigEndian.Uint16(frame[2:4])
-	payloadSize := binary.BigEndian.Uint32(frame[12:16])
-	if int(payloadSize) > len(frame)-headerSize {
-		return nil, binaryPayloadKindAudio, errors.New("xiaozhi binary v2 invalid payload size")
-	}
-	payload := frame[headerSize : headerSize+int(payloadSize)]
-	switch msgType {
-	case binaryPayloadTypeAudio:
-		return payload, binaryPayloadKindAudio, nil
-	case binaryPayloadTypeCmd:
-		return payload, binaryPayloadKindCmd, nil
-	default:
-		return nil, binaryPayloadKindAudio, errors.New("xiaozhi binary v2 unsupported payload type")
-	}
-}
-
-func decodeBinaryProtocol3(frame []byte) ([]byte, binaryPayloadKind, error) {
-	const headerSize = 4
-	if len(frame) < headerSize {
-		return nil, binaryPayloadKindAudio, errors.New("xiaozhi binary v3 frame too short")
-	}
-	msgType := frame[0]
-	payloadSize := binary.BigEndian.Uint16(frame[2:4])
-	if int(payloadSize) > len(frame)-headerSize {
-		return nil, binaryPayloadKindAudio, errors.New("xiaozhi binary v3 invalid payload size")
-	}
-	payload := frame[headerSize : headerSize+int(payloadSize)]
-	switch msgType {
-	case binaryPayloadTypeAudio:
-		return payload, binaryPayloadKindAudio, nil
-	case binaryPayloadTypeCmd:
-		return payload, binaryPayloadKindCmd, nil
-	default:
-		return nil, binaryPayloadKindAudio, errors.New("xiaozhi binary v3 unsupported payload type")
-	}
-}
-
-func packBinaryPayload(version int, payload []byte) []byte {
-	switch normalizeProtocolVersion(version) {
-	case protocolV2:
-		return packBinaryProtocol2(payload)
-	case protocolV3:
-		return packBinaryProtocol3(payload)
-	default:
-		return payload
-	}
-}
-
-func packBinaryProtocol2(payload []byte) []byte {
-	const headerSize = 16
-	head := make([]byte, headerSize)
-	binary.BigEndian.PutUint16(head[0:2], protocolV2)
-	binary.BigEndian.PutUint16(head[2:4], binaryPayloadTypeAudio)
-	binary.BigEndian.PutUint32(head[4:8], 0)
-	binary.BigEndian.PutUint32(head[8:12], uint32(time.Now().UnixMilli()))
-	binary.BigEndian.PutUint32(head[12:16], uint32(len(payload)))
-	return append(head, payload...)
-}
-
-func packBinaryProtocol3(payload []byte) []byte {
-	head := make([]byte, 4)
-	head[0] = binaryPayloadTypeAudio
-	head[1] = 0
-	binary.BigEndian.PutUint16(head[2:4], uint16(len(payload)))
-	return append(head, payload...)
+func (c *Client) decodeBinaryPayload(frame []byte) ([]byte, xzcodec.PayloadKind, error) {
+	return xzcodec.Decode(c.getProtocolVersion(), frame)
 }
 
 func (c *Client) handleTextMessage(data []byte) {
@@ -985,12 +894,7 @@ func normalizeAudioFormat(format string) string {
 }
 
 func normalizeProtocolVersion(version int) int {
-	switch version {
-	case protocolV2, protocolV3:
-		return version
-	default:
-		return protocolV1
-	}
+	return xzcodec.NormalizeVersion(version)
 }
 
 func (c *Client) reportError(err error) {

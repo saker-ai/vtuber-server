@@ -22,6 +22,8 @@ import (
 
 	appconfig "github.com/saker-ai/vtuber-server/internal/config"
 	"github.com/saker-ai/vtuber-server/internal/group"
+	"github.com/saker-ai/vtuber-server/internal/protocol"
+	"github.com/saker-ai/vtuber-server/internal/session/fsm"
 	"github.com/saker-ai/vtuber-server/internal/storage"
 	"github.com/saker-ai/vtuber-server/pkg/audio"
 	"github.com/saker-ai/vtuber-server/pkg/xiaozhi"
@@ -37,24 +39,7 @@ type Handler struct {
 	mu       sync.Mutex
 }
 
-type incomingMessage struct {
-	Type       string    `json:"type"`
-	Text       string    `json:"text,omitempty"`
-	File       string    `json:"file,omitempty"`
-	Audio      []float64 `json:"audio,omitempty"`
-	AudioPCM   string    `json:"audio_pcm,omitempty"`
-	AudioRate  int       `json:"audio_sample_rate,omitempty"`
-	AudioCh    int       `json:"audio_channels,omitempty"`
-	ListenMode string    `json:"listen_mode,omitempty"`
-	RequestID  string    `json:"request_id,omitempty"`
-	Success    *bool     `json:"success,omitempty"`
-	Image      string    `json:"image,omitempty"`
-	MimeType   string    `json:"mime_type,omitempty"`
-	Message    string    `json:"message,omitempty"`
-	InviteeUID string    `json:"invitee_uid,omitempty"`
-	TargetUID  string    `json:"target_uid,omitempty"`
-	HistoryUID string    `json:"history_uid,omitempty"`
-}
+type incomingMessage = protocol.ClientCommand
 
 type session struct {
 	conn             *websocket.Conn
@@ -91,6 +76,7 @@ type session struct {
 	opusScratch      []int16
 	pcmBytesScratch  []byte
 	listenMode       string
+	stateMachine     *fsm.Machine
 
 	mcpMu          sync.Mutex
 	mcpWaiters     map[string]chan captureResponse
@@ -213,10 +199,12 @@ func (h *Handler) Handle(w http.ResponseWriter, r *http.Request) {
 		inputChannels:   h.config.XiaoZhiChannels,
 		frameSamples:    h.config.XiaoZhiSampleRate * h.config.XiaoZhiFrameDuration / 1000,
 		listenMode:      h.config.XiaoZhiListenMode,
+		stateMachine:    fsm.New(),
 		mcpWaiters:      make(map[string]chan captureResponse),
 		deviceID:        xzCfg.DeviceID,
 		clientID:        xzCfg.ClientID,
 	}
+	sess.stateMachine.SetMode(sess.listenMode)
 	if sess.audioFormat == "opus" {
 		if enc, err := audio.AcquireOpusEncoder(sess.sampleRate, sess.channels, sess.frameDuration); err != nil {
 			sess.logger.Warn("opus encoder init failed", zap.Error(err))
@@ -347,69 +335,7 @@ func (h *Handler) Handle(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *session) handleIncoming(ctx context.Context, msg incomingMessage) {
-	switch msg.Type {
-	case "text-input":
-		text := msg.Text
-		if text == "" {
-			return
-		}
-		if err := s.xiaozhi.SendTextInput(ctx, text); err != nil {
-			s.sendJSON(map[string]any{"type": "error", "message": err.Error()})
-		}
-	case "interrupt-signal":
-		if err := s.xiaozhi.Abort(ctx); err != nil {
-			s.sendJSON(map[string]any{"type": "error", "message": err.Error()})
-		}
-		s.endConversation()
-	case "mic-audio-data":
-		if msg.AudioPCM != "" {
-			s.handleMicAudioPCM(ctx, msg.AudioPCM, msg.AudioRate, msg.AudioCh)
-		} else {
-			s.handleMicAudio(ctx, msg.Audio)
-		}
-	case "mic-audio-end":
-		s.handleMicEnd(ctx)
-	case "set-listen-mode":
-		s.handleSetListenMode(msg.ListenMode)
-	case "mcp-capture-response":
-		s.handleCaptureResponse(msg)
-	case "frontend-playback-complete":
-		s.sendJSON(map[string]any{"type": "force-new-message"})
-	case "audio-play-start":
-		return
-	case "fetch-configs":
-		s.handleFetchConfigs(ctx)
-	case "switch-config":
-		s.handleConfigSwitch(ctx, msg.File)
-	case "fetch-backgrounds":
-		s.handleFetchBackgrounds(ctx)
-	case "request-init-config":
-		s.handleInitConfig(ctx)
-	case "fetch-history-list":
-		s.handleHistoryList(ctx)
-	case "fetch-and-set-history":
-		s.handleFetchHistory(ctx, msg.HistoryUID)
-	case "create-new-history":
-		s.handleCreateHistory(ctx)
-	case "delete-history":
-		s.handleDeleteHistory(ctx, msg.HistoryUID)
-	case "request-group-info":
-		s.handleGroupInfo(ctx)
-	case "add-client-to-group":
-		s.handleAddToGroup(ctx, msg.InviteeUID)
-	case "remove-client-from-group":
-		s.handleRemoveFromGroup(ctx, msg.TargetUID)
-	case "ai-speak-signal":
-		s.sendJSON(map[string]any{"type": "error", "message": "proactive speak not supported in XiaoZhi mode"})
-	case "heartbeat":
-		return
-	default:
-		s.logger.Debug("ws unknown message type",
-			zap.String("session_id", s.clientUID),
-			zap.String("type", msg.Type),
-		)
-		return
-	}
+	s.dispatchIncoming(ctx, msg)
 }
 
 func (s *session) getListenMode() string {
@@ -474,6 +400,7 @@ func (s *session) ensureListening(ctx context.Context, reason string) bool {
 		)
 		return false
 	}
+	s.stateMachine.OnListenStart()
 	s.logger.Info("xiaozhi listen start",
 		zap.String("session_id", s.clientUID),
 		zap.String("mode", mode),
@@ -585,6 +512,7 @@ func (s *session) handleMicEnd(ctx context.Context) {
 	)
 	s.micChunkCount = 0
 	s.micBytes = 0
+	s.stateMachine.OnAudioCommit()
 	s.ensureConversation()
 	if s.llmText == "" {
 		s.sendJSON(map[string]any{"type": "full-text", "text": "Thinking..."})
@@ -607,6 +535,7 @@ func (s *session) handleSetListenMode(mode string) {
 			)
 		}
 		s.setListenMode(mode)
+		s.stateMachine.SetMode(mode)
 		s.xiaozhi.SetListenMode(mode)
 	default:
 		s.logger.Warn("invalid listen mode",
@@ -992,6 +921,7 @@ func (s *session) ensureConversation() {
 	s.ttsBuffer = nil
 	s.ttsSampleRate = 0
 	s.ttsChannels = 0
+	s.stateMachine.OnConversationStart()
 	s.sendJSON(map[string]any{"type": "control", "text": "conversation-chain-start"})
 }
 
@@ -1006,6 +936,7 @@ func (s *session) endConversation() {
 	s.ttsBuffer = nil
 	s.ttsSampleRate = 0
 	s.ttsChannels = 0
+	_ = s.stateMachine.Force(fsm.StateIdle)
 	s.sendJSON(map[string]any{"type": "control", "text": "conversation-chain-end"})
 }
 
@@ -1020,6 +951,7 @@ func (s *session) handleTTS(ctx context.Context, state string, text string) {
 		s.sendJSON(map[string]any{"type": "full-text", "text": s.llmText})
 	case "start":
 		s.ensureConversation()
+		s.stateMachine.OnTTSStart()
 		s.ttsActive = true
 		s.displaySent = false
 		s.ttsBuffer = nil
@@ -1034,6 +966,7 @@ func (s *session) handleTTS(ctx context.Context, state string, text string) {
 		}
 	case "stop":
 		s.ttsActive = false
+		s.stateMachine.OnTTSStop()
 		s.flushTTSAudio(true)
 		s.sendJSON(map[string]any{"type": "backend-synth-complete"})
 		s.logger.Info("tts stop",

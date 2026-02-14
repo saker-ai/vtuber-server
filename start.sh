@@ -4,8 +4,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-DEFAULT_PORT="${DEFAULT_PORT:-8101}"
+FALLBACK_PORT="8101"
 CONFIG_PATH="${CONFIG_PATH:-}"
+
+# Backward-compatible alias:
+# If DEFAULT_PORT is provided, treat it as MIO_SERVER_PORT.
+if [[ -z "${MIO_SERVER_PORT:-}" ]] && [[ -n "${DEFAULT_PORT:-}" ]]; then
+  MIO_SERVER_PORT="$DEFAULT_PORT"
+fi
 
 extract_port_from_http_addr() {
   local addr="$1"
@@ -115,13 +121,13 @@ if [[ -z "$PORT" ]]; then
   elif [[ -n "${CONFIG_PATH:-}" ]] && PORT=$(extract_port_from_config "$CONFIG_PATH"); then
     :
   else
-    PORT="$DEFAULT_PORT"
+    PORT="$FALLBACK_PORT"
   fi
 fi
 
-if [[ -n "${MIO_SERVER_PORT:-}" ]]; then
-  export MIO_SYSTEM_CONFIG_PORT="$MIO_SERVER_PORT"
-fi
+# Always keep runtime env in sync with resolved PORT so Go config sees one value.
+export MIO_SERVER_PORT="$PORT"
+export MIO_SYSTEM_CONFIG_PORT="$PORT"
 
 echo "检查 vtuber-server 端口: $PORT"
 check_and_kill_port "$PORT"

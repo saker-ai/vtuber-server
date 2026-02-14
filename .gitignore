@@ -47,6 +47,11 @@ Thumbs.db
 .tmp/
 .tmp.*
 /tmp/
+.cache/
+
+# Local runtime/profiling artifacts
+*.pid
+*.prof
 
 # Coverage
 coverage.out

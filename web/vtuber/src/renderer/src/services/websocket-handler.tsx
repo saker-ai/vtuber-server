@@ -22,6 +22,7 @@ import { useGroup } from '@/context/group-context';
 import { useInterrupt } from '@/hooks/utils/use-interrupt';
 import { useBrowser } from '@/context/browser-context';
 import { useMediaCapture } from '@/hooks/utils/use-media-capture';
+import { useAppStore } from '@/store/app-store';
 
 const isAudioDebugEnabled = () => {
   if (import.meta.env.VITE_DEBUG_AUDIO === 'true') return true;
@@ -60,7 +61,7 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
   const [wsState, setWsState] = useState<string>('CLOSED');
   const [wsUrl, setWsUrl] = useLocalStorage<string>('wsUrl', defaultWsUrl);
   const [baseUrl, setBaseUrl] = useLocalStorage<string>('baseUrl', defaultBaseUrl);
-  const { aiState, setAiState, backendSynthComplete, setBackendSynthComplete } = useAiState();
+  const { aiState, setAiState, setBackendSynthComplete } = useAiState();
   const { setModelInfo } = useLive2DConfig();
   const { setSubtitleText } = useSubtitle();
   const {
@@ -140,6 +141,9 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
   const {
     setCurrentHistoryUid, setMessages, setHistoryList,
   } = useChatHistory();
+  const setStoreWSState = useAppStore((state) => state.setWSState);
+  const setStoreWSEndpoints = useAppStore((state) => state.setWSEndpoints);
+  const setStoreHistoryUid = useAppStore((state) => state.setCurrentHistoryUid);
 
   const handleControlMessage = useCallback((controlText: string) => {
     switch (controlText) {
@@ -176,264 +180,207 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
     }
   }, [setAiState, clearResponse, setForceNewMessage, startMic, stopMic]);
 
-  const handleWebSocketMessage = useCallback((message: MessageEvent) => {
-    console.log('Received message from server:', message);
-    switch (message.type) {
-      case 'control':
-        if (message.text) {
-          handleControlMessage(message.text);
-        }
-        break;
-      case 'set-model-and-conf':
-        setAiState('loading');
-        if (message.conf_name) {
-          setConfName(message.conf_name);
-        }
-        if (message.conf_uid) {
-          setConfUid(message.conf_uid);
-          console.log('confUid', message.conf_uid);
-        }
-        if (message.client_uid) {
-          setSelfUid(message.client_uid);
-        }
-        setPendingModelInfo(message.model_info);
-        // setModelInfo(message.model_info);
-        // We don't know when the confRef in live2d-config-context will be updated, so we set a delay here for convenience
-        if (message.model_info && !message.model_info.url.startsWith("http")) {
-          const modelUrl = baseUrl + message.model_info.url;
-          // eslint-disable-next-line no-param-reassign
-          message.model_info.url = modelUrl;
-        }
-
-        setAiState('idle');
-        break;
-      case 'full-text':
-        if (message.text) {
-          setSubtitleText(message.text);
-          if (
-            message.text !== 'Thinking...'
-            && message.text !== 'Connection established'
-            && message.text !== 'AI wants to speak something...'
-          ) {
-            upsertAIMessage(message.text);
-          }
-        }
-        break;
-      case 'config-files':
-        if (message.configs) {
-          setConfigFiles(message.configs);
-        }
-        break;
-      case 'config-switched':
-        setAiState('idle');
-        setSubtitleText(t('notification.characterLoaded'));
-
-        toaster.create({
-          title: t('notification.characterSwitched'),
-          type: 'success',
-          duration: 2000,
+  type HandlerMap = Record<string, (message: MessageEvent) => void>;
+  const messageHandlers = useMemo<HandlerMap>(() => ({
+    control: (message) => {
+      if (message.text) {
+        handleControlMessage(message.text);
+      }
+    },
+    'set-model-and-conf': (message) => {
+      setAiState('loading');
+      if (message.conf_name) setConfName(message.conf_name);
+      if (message.conf_uid) {
+        setConfUid(message.conf_uid);
+        console.log('confUid', message.conf_uid);
+      }
+      if (message.client_uid) setSelfUid(message.client_uid);
+      setPendingModelInfo(message.model_info);
+      if (message.model_info && !message.model_info.url.startsWith("http")) {
+        message.model_info.url = baseUrl + message.model_info.url;
+      }
+      setAiState('idle');
+    },
+    'full-text': (message) => {
+      if (!message.text) return;
+      setSubtitleText(message.text);
+      if (
+        message.text !== 'Thinking...'
+        && message.text !== 'Connection established'
+        && message.text !== 'AI wants to speak something...'
+      ) {
+        upsertAIMessage(message.text);
+      }
+    },
+    'config-files': (message) => {
+      if (message.configs) setConfigFiles(message.configs);
+    },
+    'config-switched': () => {
+      setAiState('idle');
+      setSubtitleText(t('notification.characterLoaded'));
+      toaster.create({ title: t('notification.characterSwitched'), type: 'success', duration: 2000 });
+      wsService.sendMessage({ type: 'fetch-history-list' });
+      wsService.sendMessage({ type: 'create-new-history' });
+    },
+    'background-files': (message) => {
+      if (message.files) bgUrlContext?.setBackgroundFiles(message.files);
+    },
+    audio: (message) => {
+      if (aiState === 'interrupted' || aiState === 'listening') {
+        console.log('Audio playback intercepted. Sentence:', message.display_text?.text);
+        return;
+      }
+      if (!voiceInterruptEnabled && !continuousStreamingEnabled) {
+        if (isAudioDebugEnabled()) console.info('[mic] auto stop (tts playing)');
+        stopMic('system');
+      }
+      if (isAudioDebugEnabled()) {
+        console.info('[audio] tts chunk', {
+          bytes: (message.audio_pcm || '').length,
+          sampleRate: message.audio_sample_rate || 0,
+          channels: message.audio_channels || 0,
+          sliceLength: message.slice_length || 0,
         });
-
-        // setModelInfo(undefined);
-
-        wsService.sendMessage({ type: 'fetch-history-list' });
-        wsService.sendMessage({ type: 'create-new-history' });
-        break;
-      case 'background-files':
-        if (message.files) {
-          bgUrlContext?.setBackgroundFiles(message.files);
-        }
-        break;
-      case 'audio':
-        if (aiState === 'interrupted' || aiState === 'listening') {
-          console.log('Audio playback intercepted. Sentence:', message.display_text?.text);
-        } else {
-          if (!voiceInterruptEnabled && !continuousStreamingEnabled) {
-            if (isAudioDebugEnabled()) {
-              console.info('[mic] auto stop (tts playing)');
-            }
-            stopMic('system');
-          }
-          console.log("actions", message.actions);
-          if (isAudioDebugEnabled()) {
-            console.info('[audio] tts chunk', {
-              bytes: (message.audio_pcm || '').length,
-              sampleRate: message.audio_sample_rate || 0,
-              channels: message.audio_channels || 0,
-              sliceLength: message.slice_length || 0,
-            });
-          }
-          addAudioTask({
-            audioBase64: message.audio || '',
-            audioPcmBase64: message.audio_pcm || '',
-            audioFormat: message.audio_format || '',
-            audioSampleRate: message.audio_sample_rate || 0,
-            audioChannels: message.audio_channels || 0,
-            volumes: message.volumes || [],
-            sliceLength: message.slice_length || 0,
-            displayText: message.display_text || null,
-            expressions: message.actions?.expressions || null,
-            forwarded: message.forwarded || false,
-          });
-        }
-        break;
-      case 'history-data':
-        if (message.messages) {
-          setMessages(message.messages);
-        }
-        toaster.create({
-          title: t('notification.historyLoaded'),
-          type: 'success',
-          duration: 2000,
-        });
-        break;
-      case 'new-history-created':
-        setAiState('idle');
-        setSubtitleText(t('notification.newConversation'));
-        // No need to open mic here
-        if (message.history_uid) {
-          setCurrentHistoryUid(message.history_uid);
-          setMessages([]);
-          const newHistory: HistoryInfo = {
-            uid: message.history_uid,
-            latest_message: null,
-            timestamp: new Date().toISOString(),
-          };
-          setHistoryList((prev: HistoryInfo[]) => [newHistory, ...prev]);
-          toaster.create({
-            title: t('notification.newChatHistory'),
-            type: 'success',
-            duration: 2000,
-          });
-        }
-        break;
-      case 'history-deleted':
-        toaster.create({
-          title: message.success
-            ? t('notification.historyDeleteSuccess')
-            : t('notification.historyDeleteFail'),
-          type: message.success ? 'success' : 'error',
-          duration: 2000,
-        });
-        break;
-      case 'history-list':
-        if (message.histories) {
-          setHistoryList(message.histories);
-          if (message.histories.length > 0) {
-            setCurrentHistoryUid(message.histories[0].uid);
-          }
-        }
-        break;
-      case 'user-input-transcription':
-        console.log('user-input-transcription: ', message.text);
-        if (message.text) {
-          appendHumanMessage(message.text);
-        }
-        break;
-      case 'error':
-        toaster.create({
-          title: message.message,
-          type: 'error',
-          duration: 2000,
-        });
-        break;
-      case 'group-update':
-        console.log('Received group-update:', message.members);
-        if (message.members) {
-          setGroupMembers(message.members);
-        }
-        if (message.is_owner !== undefined) {
-          setIsOwner(message.is_owner);
-        }
-        break;
-      case 'group-operation-result':
-        toaster.create({
-          title: message.message,
-          type: message.success ? 'success' : 'error',
-          duration: 2000,
-        });
-        break;
-      case 'backend-synth-complete':
-        setBackendSynthComplete(true);
-        break;
-      case 'conversation-chain-end':
-        if (!audioTaskQueue.hasTask()) {
-          setAiState((currentState: AiState) => {
-            if (currentState === 'thinking-speaking') {
-              return 'idle';
-            }
-            return currentState;
-          });
-        }
-        break;
-      case 'force-new-message':
-        setForceNewMessage(true);
-        if (!voiceInterruptEnabled && !continuousStreamingEnabled) {
-          if (isAudioDebugEnabled()) {
-            console.info('[mic] auto start (tts finished)');
-          }
-          startMic('auto');
-        }
-        break;
-      case 'interrupt-signal':
-        // Handle forwarded interrupt
-        interrupt(false); // do not send interrupt signal to server
-        break;
-      case 'tool_call_status':
-        if (message.tool_id && message.tool_name && message.status) {
-          // If there's browser view data included, store it in the browser context
-          if (message.browser_view) {
-            console.log('Browser view data received:', message.browser_view);
-            setBrowserViewData(message.browser_view);
-          }
-
-          appendOrUpdateToolCallMessage({
-            id: message.tool_id,
-            type: 'tool_call_status',
-            role: 'ai',
-            tool_id: message.tool_id,
-            tool_name: message.tool_name,
-            name: message.name,
-            status: message.status as ('running' | 'completed' | 'error'),
-            content: message.content || '',
-            timestamp: message.timestamp || new Date().toISOString(),
-          });
-        } else {
-          console.warn('Received incomplete tool_call_status message:', message);
-        }
-        break;
-      case 'mcp-capture-request':
-        void (async () => {
-          const requestId = message.request_id || '';
-          const source = message.source === 'screen' ? 'screen' : 'camera';
-          const capture =
-            source === 'screen' ? await captureScreen() : await captureCamera();
-          if (!capture) {
-            wsService.sendMessage({
-              type: 'mcp-capture-response',
-              request_id: requestId,
-              success: false,
-              message: `No ${source} stream available`,
-            });
-            return;
-          }
+      }
+      addAudioTask({
+        audioBase64: message.audio || '',
+        audioPcmBase64: message.audio_pcm || '',
+        audioFormat: message.audio_format || '',
+        audioSampleRate: message.audio_sample_rate || 0,
+        audioChannels: message.audio_channels || 0,
+        volumes: message.volumes || [],
+        sliceLength: message.slice_length || 0,
+        displayText: message.display_text || null,
+        expressions: message.actions?.expressions || null,
+        forwarded: message.forwarded || false,
+      });
+    },
+    'history-data': (message) => {
+      if (message.messages) setMessages(message.messages);
+      toaster.create({ title: t('notification.historyLoaded'), type: 'success', duration: 2000 });
+    },
+    'new-history-created': (message) => {
+      setAiState('idle');
+      setSubtitleText(t('notification.newConversation'));
+      if (!message.history_uid) return;
+      setCurrentHistoryUid(message.history_uid);
+      setStoreHistoryUid(message.history_uid);
+      setMessages([]);
+      const newHistory: HistoryInfo = {
+        uid: message.history_uid,
+        latest_message: null,
+        timestamp: new Date().toISOString(),
+      };
+      setHistoryList((prev: HistoryInfo[]) => [newHistory, ...prev]);
+      toaster.create({ title: t('notification.newChatHistory'), type: 'success', duration: 2000 });
+    },
+    'history-deleted': (message) => {
+      toaster.create({
+        title: message.success ? t('notification.historyDeleteSuccess') : t('notification.historyDeleteFail'),
+        type: message.success ? 'success' : 'error',
+        duration: 2000,
+      });
+    },
+    'history-list': (message) => {
+      if (!message.histories) return;
+      setHistoryList(message.histories);
+      if (message.histories.length > 0) {
+        setCurrentHistoryUid(message.histories[0].uid);
+        setStoreHistoryUid(message.histories[0].uid);
+      }
+    },
+    'user-input-transcription': (message) => {
+      if (message.text) appendHumanMessage(message.text);
+    },
+    error: (message) => {
+      toaster.create({ title: message.message, type: 'error', duration: 2000 });
+    },
+    'group-update': (message) => {
+      if (message.members) setGroupMembers(message.members);
+      if (message.is_owner !== undefined) setIsOwner(message.is_owner);
+    },
+    'group-operation-result': (message) => {
+      toaster.create({ title: message.message, type: message.success ? 'success' : 'error', duration: 2000 });
+    },
+    'backend-synth-complete': () => {
+      setBackendSynthComplete(true);
+    },
+    'conversation-chain-end': () => {
+      if (!audioTaskQueue.hasTask()) {
+        setAiState((currentState: AiState) => (currentState === 'thinking-speaking' ? 'idle' : currentState));
+      }
+    },
+    'force-new-message': () => {
+      setForceNewMessage(true);
+      if (!voiceInterruptEnabled && !continuousStreamingEnabled) {
+        if (isAudioDebugEnabled()) console.info('[mic] auto start (tts finished)');
+        startMic('auto');
+      }
+    },
+    'interrupt-signal': () => {
+      interrupt(false);
+    },
+    'tool_call_status': (message) => {
+      if (!(message.tool_id && message.tool_name && message.status)) {
+        console.warn('Received incomplete tool_call_status message:', message);
+        return;
+      }
+      if (message.browser_view) setBrowserViewData(message.browser_view);
+      appendOrUpdateToolCallMessage({
+        id: message.tool_id,
+        type: 'tool_call_status',
+        role: 'ai',
+        tool_id: message.tool_id,
+        tool_name: message.tool_name,
+        name: message.name,
+        status: message.status as ('running' | 'completed' | 'error'),
+        content: message.content || '',
+        timestamp: message.timestamp || new Date().toISOString(),
+      });
+    },
+    'mcp-capture-request': (message) => {
+      void (async () => {
+        const requestId = message.request_id || '';
+        const source = message.source === 'screen' ? 'screen' : 'camera';
+        const capture = source === 'screen' ? await captureScreen() : await captureCamera();
+        if (!capture) {
           wsService.sendMessage({
             type: 'mcp-capture-response',
             request_id: requestId,
-            success: true,
-            image: capture.data,
-            mime_type: capture.mime_type,
+            success: false,
+            message: `No ${source} stream available`,
           });
-        })();
-        break;
-      default:
-        console.warn('Unknown message type:', message.type);
+          return;
+        }
+        wsService.sendMessage({
+          type: 'mcp-capture-response',
+          request_id: requestId,
+          success: true,
+          image: capture.data,
+          mime_type: capture.mime_type,
+        });
+      })();
+    },
+  }), [aiState, addAudioTask, appendHumanMessage, appendOrUpdateToolCallMessage, baseUrl, bgUrlContext, captureCamera, captureScreen, continuousStreamingEnabled, handleControlMessage, interrupt, setAiState, setBackendSynthComplete, setBrowserViewData, setConfName, setConfUid, setConfigFiles, setCurrentHistoryUid, setForceNewMessage, setGroupMembers, setHistoryList, setIsOwner, setMessages, setSelfUid, setStoreHistoryUid, setSubtitleText, startMic, stopMic, t, upsertAIMessage, voiceInterruptEnabled]);
+
+  const handleWebSocketMessage = useCallback((message: MessageEvent) => {
+    console.log('Received message from server:', message);
+    const eventType = message.type || '';
+    const handler = messageHandlers[eventType];
+    if (handler) {
+      handler(message);
+      return;
     }
-  }, [aiState, addAudioTask, appendHumanMessage, baseUrl, bgUrlContext, setAiState, setConfName, setConfUid, setConfigFiles, setCurrentHistoryUid, setHistoryList, setMessages, setModelInfo, setSubtitleText, startMic, stopMic, setSelfUid, setGroupMembers, setIsOwner, backendSynthComplete, setBackendSynthComplete, clearResponse, handleControlMessage, appendOrUpdateToolCallMessage, upsertAIMessage, interrupt, setBrowserViewData, t, captureCamera, captureScreen, voiceInterruptEnabled, continuousStreamingEnabled]);
+    console.warn('Unknown message type:', message.type);
+  }, [messageHandlers]);
 
   useEffect(() => {
     wsService.connect(normalizedWsUrl);
   }, [normalizedWsUrl]);
+
+  useEffect(() => {
+    setStoreWSEndpoints(normalizedWsUrl, normalizedBaseUrl);
+  }, [normalizedBaseUrl, normalizedWsUrl, setStoreWSEndpoints]);
 
   useEffect(() => {
     const handleBeforeUnload = () => {
@@ -458,6 +405,11 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
       messageSubscription.unsubscribe();
     };
   }, [normalizedWsUrl, handleWebSocketMessage]);
+
+  useEffect(() => {
+    const state = wsState as ('CONNECTING' | 'OPEN' | 'CLOSING' | 'CLOSED');
+    setStoreWSState(state);
+  }, [setStoreWSState, wsState]);
 
   useEffect(() => {
     if (wsState !== 'OPEN') {

@@ -569,8 +569,12 @@ const handleSpeechEnd = useCallback((audio: Float32Array) => {
     setPreviousTriggeredProbability(0);
     if (!continuousStreamingRuntimeRef.current) {
       sendAudioPartitionRef.current(audio, VAD_OUTPUT_SAMPLE_RATE, VAD_OUTPUT_CHANNELS);
-    } else if (isAudioDebugEnabled()) {
-      console.info('[audio] speech end on continuous mode, skip utterance upload');
+    } else {
+      // Continuous upstream still needs a turn-end marker so backend can flush VAD/ASR.
+      void sendMicAudioEndRef.current(true);
+      if (isAudioDebugEnabled()) {
+        console.info('[audio] speech end on continuous mode, emit mic end');
+      }
     }
     isProcessingRef.current = false;
     setAiStateRef.current('thinking-speaking');
